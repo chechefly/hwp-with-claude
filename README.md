@@ -63,4 +63,4 @@ Claude가 알아서: 구조 파악 → 채우기 → 확인(이미지) → 저�
 ## 📜 라이선스 / 만든이
 
 MIT License — 자유롭게 쓰고 공유하세요.
-Made by **[여기에 이름/GitHub 아이디]**. 도움이 됐다면 ⭐ Star 부탁드려요!
+Made by **chechefly (github.com/chechefly)**. 도움이 됐다면 ⭐ Star 부탁드려요!

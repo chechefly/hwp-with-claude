@@ -31,7 +31,7 @@ from mcp.server.fastmcp import FastMCP
 
 __version__ = "0.1.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
-_UPDATE_URL = "https://raw.githubusercontent.com/CHANGE_ME/hwp-with-claude/main/version.json"
+_UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
 mcp = FastMCP("hwp_mcp")
 
