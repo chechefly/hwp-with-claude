@@ -24,18 +24,25 @@
 | **Claude 데스크톱 앱** | Claude Desktop / Cowork / Claude Code |
 | ~~Python~~ | **자동 설치됩니다** — 없으면 `install.bat`이 알아서 깔아줍니다 ✅ |
 
-## 🚀 설치 (2단계)
+## 🚀 설치 — 셋 중 편한 것 하나 (파이썬 없어도 자동설치)
 
-1. 이 저장소를 **Download ZIP** → 압축 풀기
-2. **모든 Claude 앱을 완전히 종료**한 뒤, `install.bat` **더블클릭**
-   - 파이썬이 없으면 **자동으로 설치**하고, 필요한 패키지·Claude 등록·스킬까지 다 잡아줍니다
-3. **Claude 데스크톱 앱을 다시 실행** → 끝!
+### A. Claude Code 사용자 → 채팅에 한 줄 (제일 쉬움)
+```
+github.com/chechefly/hwp-with-claude 설치해줘
+```
+Claude가 다운로드·설치·안내까지 알아서 합니다.
 
-> **Claude Code 사용자라면** 더 간단해요. 채팅에 이 한 줄만:
-> ```
-> https://github.com/chechefly/hwp-with-claude 이 저장소 받아서 설치해줘
-> ```
-> → Claude Code가 다운로드·파이썬·등록까지 알아서 합니다.
+### B. Claude Code 없어도 → PowerShell 한 줄
+`Win + X` → **터미널**(또는 Windows PowerShell) 열고 붙여넣기:
+```
+irm https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/web-install.ps1 | iex
+```
+다운로드 → 파이썬 자동설치 → 등록까지 **한 방에**.
+
+### C. 수동 (위가 막히는 회사 PC 등)
+[**⬇️ ZIP 바로 다운로드**](https://github.com/chechefly/hwp-with-claude/archive/refs/heads/main.zip) → 압축 풀기 → `install.bat` 더블클릭
+
+> 세 방법 모두 파이썬 없으면 **자동 설치**하고, 안정된 위치(`%LOCALAPPDATA%\hwp-with-claude`)에 깔려 경로가 안 깨집니다.
 
 ## ✅ 설치 후 (이거 안 하면 도구가 안 떠요!)
 
