@@ -21,15 +21,21 @@
 |---|---|
 | **Windows** | 한/글이 Windows 전용이라 필수 (Mac ❌) |
 | **한/글(HWP) 프로그램** | PC에 설치돼 있어야 함 |
-| **Python** | 없으면 https://www.python.org/downloads/ 에서 설치 (설치 시 "Add Python to PATH" 체크) |
 | **Claude 데스크톱 앱** | Claude Desktop / Cowork / Claude Code |
+| ~~Python~~ | **자동 설치됩니다** — 없으면 `install.bat`이 알아서 깔아줍니다 ✅ |
 
-## 🚀 설치 (3단계)
+## 🚀 설치 (2단계)
 
-1. 이 저장소를 **Download ZIP** → 압축 풀기 (또는 `git clone`)
+1. 이 저장소를 **Download ZIP** → 압축 풀기
 2. **모든 Claude 앱을 완전히 종료**한 뒤, `install.bat` **더블클릭**
-   - 알아서 필요한 패키지 설치 + Claude에 자동 등록됩니다
-3. **Claude 데스크톱 앱을 다시 실행**
+   - 파이썬이 없으면 **자동으로 설치**하고, 필요한 패키지·Claude 등록·스킬까지 다 잡아줍니다
+3. **Claude 데스크톱 앱을 다시 실행** → 끝!
+
+> **Claude Code 사용자라면** 더 간단해요. 채팅에 이 한 줄만:
+> ```
+> https://github.com/chechefly/hwp-with-claude 이 저장소 받아서 설치해줘
+> ```
+> → Claude Code가 다운로드·파이썬·등록까지 알아서 합니다.
 
 끝! 이제 새 채팅에서 아래처럼 시켜보세요.
 

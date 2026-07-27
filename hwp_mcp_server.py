@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 

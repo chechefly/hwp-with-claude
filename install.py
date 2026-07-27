@@ -129,7 +129,3 @@ if __name__ == "__main__":
         open(LOG, "w", encoding="utf-8").write("\n".join(_lines))
     except Exception:
         pass
-    try:
-        input("\n엔터를 누르면 종료합니다...")
-    except Exception:
-        pass
