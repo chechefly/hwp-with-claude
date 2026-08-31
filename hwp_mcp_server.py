@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -30,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -99,6 +100,16 @@ def _list_backups(path: str) -> List[str]:
     items = [os.path.join(d, f) for f in os.listdir(d) if f.startswith(base + ".")]
     items.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return items
+
+
+def _clear_readonly(path: str) -> None:
+    """저장 대상 파일이 읽기전용이면 쓰기 가능으로 바꾼다(다운로드한 관공서 .hwp가 읽기전용인
+    경우가 흔함 → SaveAs가 조용히 실패). 파일이 없으면(신규 저장) 무시."""
+    try:
+        if path and os.path.exists(path) and not os.access(path, os.W_OK):
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
 
 
 def _clear_clipboard() -> None:
@@ -211,6 +222,9 @@ class HwpWorker:
 
     def op_open(self, path: str) -> str:
         hwp = self._ensure_engine()
+        # ★열기 전에 read-only 해제: HWP가 읽기전용 파일을 열면 읽기전용 모드로 고정돼
+        #   이후 저장(SaveAs 같은 경로)이 조용히 실패한다. 다운로드한 관공서 .hwp에 흔함.
+        _clear_readonly(path)
         if not hwp.Open(path, "", "forceopen:true"):
             raise RuntimeError(f"파일을 열지 못했습니다: {path}")
         self._set_visible(_VISIBLE)
@@ -279,16 +293,20 @@ class HwpWorker:
 
     def op_save(self) -> str:
         hwp = self._require_doc()
-        if not self._current_path:
+        path = self._current_path
+        if not path:
             raise RuntimeError("현재 문서에 경로가 없습니다. save_as를 사용하세요.")
         # Save(save_if_dirty) — 인자 필요. 안전하게 SaveAs로 현재 경로에 저장(포맷 자동판별).
-        fmt = "HWPX" if self._current_path.lower().endswith(".hwpx") else "HWP"
-        if not hwp.SaveAs(self._current_path, fmt, ""):
-            raise RuntimeError(f"저장 실패: {self._current_path}")
-        return self._current_path
+        # (hwp_render는 내보내기 후 문서를 다시 열어 경로를 복구하므로 여기선 단순 저장으로 충분)
+        fmt = "HWPX" if path.lower().endswith(".hwpx") else "HWP"
+        _clear_readonly(path)
+        if not hwp.SaveAs(path, fmt, ""):
+            raise RuntimeError(f"저장 실패: {path}")
+        return path
 
     def op_save_as(self, path: str, fmt: str) -> str:
         hwp = self._require_doc()
+        _clear_readonly(path)
         if not hwp.SaveAs(path, fmt, ""):
             raise RuntimeError(f"저장 실패: {path}")
         if fmt.upper() == "HWP":
@@ -297,6 +315,7 @@ class HwpWorker:
 
     def op_export_pdf(self, path: str) -> str:
         hwp = self._require_doc()
+        _clear_readonly(path)
         if not hwp.SaveAs(path, "PDF", ""):
             raise RuntimeError("PDF 내보내기 실패")
         return path
@@ -489,67 +508,71 @@ class HwpWorker:
         □(U+25A1)은 AllReplace로, ☐(U+2610)은 Find-이동으로 처리 → 두 종류 모두 커버.
         박스가 라벨 앞이든 뒤든 자동 시도. 반환: {라벨: 결과}."""
         hwp = self._require_doc()
+
+        def _allreplace(find, repl):
+            before = hwp.GetTextFile("TEXT", "")
+            cnt = before.count(find)
+            if not cnt:
+                return 0
+            act = hwp.CreateAction("AllReplace")
+            p = act.CreateSet()
+            p.SetItem("FindString", find)
+            p.SetItem("ReplaceString", repl)
+            p.SetItem("IgnoreMessage", 1)
+            p.SetItem("Direction", 0)
+            p.SetItem("ReplaceMode", 1)
+            p.SetItem("MatchCase", 1)
+            act.Execute(p)
+            return cnt
+
         out = {}
         for label in labels:
-            # 1) □(U+25A1): 라벨 앞/뒤 4패턴 AllReplace
+            # 1) 빈 네모(□ U+25A1, ☐ U+2610)를 라벨 앞/뒤에서 찾아 mark로 '교체'(삽입 아님 → 이중박스 방지)
+            #    안쪽 공백 0~2칸까지 허용. 기존 박스 문자를 실제로 mark로 바꾼다.
             did = 0
-            for find, repl in [("□" + label, mark + label),
-                               ("□ " + label, mark + " " + label),
-                               (label + "□", label + mark),
-                               (label + " □", label + " " + mark)]:
-                before = hwp.GetTextFile("TEXT", "")
-                cnt = before.count(find)
-                if cnt:
-                    act = hwp.CreateAction("AllReplace")
-                    p = act.CreateSet()
-                    p.SetItem("FindString", find)
-                    p.SetItem("ReplaceString", repl)
-                    p.SetItem("IgnoreMessage", 1)
-                    p.SetItem("Direction", 0)
-                    p.SetItem("ReplaceMode", 1)
-                    p.SetItem("MatchCase", 1)
-                    act.Execute(p)
-                    did += cnt
+            for box in ("□", "☐"):
+                for find, repl in [(box + label, mark + label),
+                                   (box + " " + label, mark + " " + label),
+                                   (box + "  " + label, mark + "  " + label),
+                                   (label + box, label + mark),
+                                   (label + " " + box, label + " " + mark),
+                                   (label + "  " + box, label + "  " + mark)]:
+                    c = _allreplace(find, repl)
+                    if c:
+                        did += c
+                        break
+                if did:
                     break
             if did:
                 out[label] = f"OK(□×{did})"
                 continue
-            # 1.5) [ ] ASCII 대괄호: 라벨 앞/뒤, 안쪽 공백 1~2칸 → [√]
+            # 1.5) [ ] ASCII 대괄호: 라벨 앞/뒤, 안쪽 공백 0~2칸 → [√](기존 대괄호 내용 교체)
             am = "√"
             did2 = 0
             for find, repl in [("[ ] " + label, "[" + am + "] " + label),
                                ("[  ] " + label, "[" + am + "] " + label),
                                ("[ ]" + label, "[" + am + "]" + label),
                                (label + " [ ]", label + " [" + am + "]"),
+                               (label + " [  ]", label + " [" + am + "]"),
                                (label + "[ ]", label + "[" + am + "]")]:
-                before = hwp.GetTextFile("TEXT", "")
-                cnt = before.count(find)
-                if cnt:
-                    act = hwp.CreateAction("AllReplace")
-                    p = act.CreateSet()
-                    p.SetItem("FindString", find)
-                    p.SetItem("ReplaceString", repl)
-                    p.SetItem("IgnoreMessage", 1)
-                    p.SetItem("Direction", 0)
-                    p.SetItem("ReplaceMode", 1)
-                    p.SetItem("MatchCase", 1)
-                    act.Execute(p)
-                    did2 += cnt
+                c = _allreplace(find, repl)
+                if c:
+                    did2 += c
                     break
             if did2:
                 out[label] = f"OK([]×{did2})"
                 continue
-            # 2) ☐(U+2610): 라벨 뒤 → 앞 순으로 Find-이동
-            n = self.op_check_after(label, mark, "after")
-            if not n:
-                n = self.op_check_after(label, mark, "before")
-            out[label] = f"OK(☐×{n})" if n else "박스 못 찾음"
+            # 2) 못 찾음 → 정직하게 실패 보고(억지 삽입으로 '☐☑' 이중박스 만들지 않음).
+            #    사용자에게 수동 체크 안내. (구 op_check_after 삽입 폴백은 이중박스 버그로 제거)
+            out[label] = "박스 못 찾음(수동 체크 필요)"
         return out
 
-    def op_fill_by_label(self, fills, direction="auto", nth=1):
+    def op_fill_by_label(self, fills, direction="auto", nth=1, text_style="reset"):
         """라벨 텍스트를 Find로 찾아 인접 칸/같은 칸에 값을 채운다(read_text가 보는 라벨을 앵커로).
         table_map 셀읽기가 실패하는 폼에도 동작. ★삽입 후 실제로 값이 들어갔는지 검증하여
         정직하게 성공/실패를 반환한다(가짜 성공 방지).
+        - text_style: 'reset'(기본, 삽입값을 검정·강조해제·기본 글자모양으로 강제) | 'keep'(칸 서식 그대로).
+          빈칸/회색 예시서식을 물려받아 값이 회색·굵게 들어가는 문제 방지.
         - direction: 'auto'(오른쪽→아래 자동, 권장) | 'right' | 'below' | 'inline'
           ※ 'auto'는 표 칸 이동(right/below)만 시도한다. 라벨과 값이 같은 칸이면 'inline'을 명시.
         - fills 값은 문자열이거나 {value, direction, nth, near} 딕셔너리(라벨별 세밀 제어).
@@ -606,6 +629,33 @@ class HwpWorker:
             ps.SetItem("Text", text)
             ac.Execute(ps)
 
+        def _reset_style(value, in_cell):
+            # 방금 넣은 값을 검정·강조해제·기본 글자모양으로 강제(회색 예시서식 상속 방지).
+            if text_style != "reset" or not value:
+                return
+            try:
+                if in_cell:
+                    hwp.HAction.Run("TableCellBlock")     # 셀 내용 전체 선택(= 방금 넣은 값)
+                else:
+                    for _ in range(len(value)):
+                        hwp.HAction.Run("MoveSelLeft")    # inline: 방금 넣은 값만 선택
+                try:
+                    hwp.HAction.Run("CharShapeClearCharShape")  # 글자모양 초기화(기본폰트·크기)
+                except Exception:
+                    pass
+                act = hwp.CreateAction("CharShape")
+                p = act.CreateSet()
+                act.GetDefault(p)
+                p.SetItem("TextColor", 0)     # 검정
+                p.SetItem("Bold", 0)
+                p.SetItem("Italic", 0)
+                p.SetItem("UnderlineType", 0)
+                act.Execute(p)
+            except Exception:
+                pass
+            finally:
+                hwp.HAction.Run("Cancel")
+
         def _do_find(s):
             pset = hwp.HParameterSet.HFindReplace
             hwp.HAction.GetDefault("RepeatFind", pset.HSet)
@@ -635,6 +685,7 @@ class HwpWorker:
             if d == "inline":
                 hwp.HAction.Run("MoveRight")   # 선택 해제(라벨 끝) → 뒤에 이어붙임
                 _insert(value)
+                _reset_style(value, in_cell=False)
                 return True
             hwp.HAction.Run("Cancel")
             crossed = _cross_right() if d == "right" else _cross_below() if d == "below" else False
@@ -644,6 +695,7 @@ class HwpWorker:
             hwp.HAction.Run("SelectAll")       # 값 칸 내용 비우기
             hwp.HAction.Run("Delete")
             _insert(value)
+            _reset_style(value, in_cell=True)
             return True
 
         out = {}
@@ -1130,6 +1182,7 @@ class FillByLabelInput(BaseModel):
     )
     direction: str = Field(default="auto", description="값 위치: 'auto'(오른쪽→아래 칸 자동, 권장·TableRightCell 안 먹히는 표도 문자이동으로 해결) | 'right' | 'below' | 'inline'(같은 칸 라벨 뒤)")
     nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터). 값 딕셔너리의 nth로 라벨별 지정 가능", ge=1)
+    text_style: str = Field(default="reset", description="삽입 값 서식: 'reset'(기본, 검정·강조해제·기본 글자모양 강제) | 'keep'(칸 서식 그대로)")
 
 
 @mcp.tool(
@@ -1153,8 +1206,11 @@ def hwp_fill_by_label(params: FillByLabelInput) -> str:
     """
     if params.direction not in ("auto", "right", "below", "inline"):
         return "Error: direction은 auto/right/below/inline 중 하나여야 합니다."
+    if params.text_style not in ("reset", "keep"):
+        return "Error: text_style은 reset/keep 중 하나여야 합니다."
     try:
-        res = _worker.submit(lambda: _worker.op_fill_by_label(params.fills, params.direction, params.nth))
+        res = _worker.submit(lambda: _worker.op_fill_by_label(
+            params.fills, params.direction, params.nth, params.text_style))
         lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
         return "[라벨 기반 채우기 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
