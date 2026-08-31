@@ -63,6 +63,10 @@ class Cell:
             cid = clean(run0.get("charPrIDRef"))
             if cid is not None:
                 run0.set("charPrIDRef", cid)
+        # ★줄배치 캐시(linesegarray) 제거 — 남겨두면 긴 텍스트가 원래 1줄 폭에
+        #   욱여넣어져 글자가 겹쳐 보인다. 지우면 한/글이 열 때 재계산.
+        for lsa in first.findall("hp:linesegarray", NS):
+            first.remove(lsa)
         t = ET.SubElement(run0, f"{{{HP}}}t")
         t.text = lines[0]
         # 2번째 줄부터: 첫 문단을 복제(문단모양·글자모양 유지)해 텍스트만 바꿔 추가
@@ -118,6 +122,11 @@ class Cell:
             done += 1
         for t, s in zip(ts, texts):
             t.text = s
+        if done:
+            # 줄배치 캐시 무효화 — 안 지우면 바뀐(길어진) 텍스트가 옛 줄 폭에 눌려 겹쳐 보임
+            for p in self.tc.iter(f"{{{HP}}}p"):
+                for lsa in p.findall("hp:linesegarray", NS):
+                    p.remove(lsa)
         return done
 
 
@@ -176,6 +185,19 @@ class HwpxDoc:
         ul = new.find(f"{{{HH}}}underline")
         if ul is not None:
             ul.set("type", "NONE")
+        # ★글꼴도 문서 기본(charPr id=0 — 본문 기본)으로 교체: 필기체·장식체 칸에 값이
+        #   손글씨처럼 들어가는 문제 방지. 크기(height)는 칸 비례 유지.
+        base = None
+        for cp in props.findall(f"{{{HH}}}charPr"):
+            if cp.get("id") == "0":
+                base = cp
+                break
+        if base is not None:
+            for tag in ("fontRef", "ratio", "spacing", "relSz", "offset"):
+                b = base.find(f"{{{HH}}}{tag}")
+                o = new.find(f"{{{HH}}}{tag}")
+                if b is not None and o is not None:
+                    o.attrib.update(b.attrib)
         new_id = str(max((int(cp.get("id", 0)) for cp in props.findall(f"{{{HH}}}charPr")), default=0) + 1)
         new.set("id", new_id)
         props.append(new)
@@ -303,8 +325,10 @@ class HwpxDoc:
     BOXES = ("□", "☐", "■")
 
     def check_by_label(self, labels: List[str], mark: str = "☑",
-                       table: Optional[int] = None) -> Dict[str, str]:
-        """라벨 앞/뒤의 빈 네모(□/☐)나 [ ]를 체크 문자로 '교체'. run 경계 무관."""
+                       table: Optional[int] = None,
+                       nth: Optional[int] = None) -> Dict[str, str]:
+        """라벨 앞/뒤의 빈 네모(□/☐)나 [ ]를 체크 문자로 '교체'. run 경계 무관.
+        nth=N이면 문서 순서상 N번째 매치 셀만 체크(같은 라벨이 여러 곳일 때)."""
         def _label_box_style(full: str) -> bool:
             """이 셀이 '라벨 뒤에 박스'(예: '동의함 ☐  동의하지 않음 ☐') 구조인가?
             셀 안 모든 박스 앞(공백 무시)이 글자로 끝날 때만 True.
@@ -328,9 +352,12 @@ class HwpxDoc:
         for label in labels:
             done = 0
             kinds = []
+            seen = 0
             for c in self.cells():
                 if table is not None and c.table_index != int(table):
                     continue
+                if nth is not None and done:
+                    break  # nth번째 하나만 체크했으면 종료
                 # ★패턴은 배타적으로: 셀에서 한 패턴이 맞으면 나머지는 시도하지 않는다.
                 before_pats = []
                 after_pats = []
@@ -347,12 +374,18 @@ class HwpxDoc:
                 patterns = list(before_pats)
                 if _label_box_style(c.text()):
                     patterns += after_pats  # '라벨 뒤 박스' 구조가 확실할 때만
-                for f, r, kind in patterns:
-                    n = c.replace_text(f, r)
-                    if n:
-                        done += n
-                        kinds.append(kind)
-                        break  # 이 셀은 처리 완료 — 다른 패턴 재시도 금지
+                ctext = c.text()
+                hit = next(((f, r, kind) for f, r, kind in patterns if f in ctext), None)
+                if hit is None:
+                    continue
+                seen += 1
+                if nth is not None and seen != nth:
+                    continue  # N번째 매치만 체크
+                f, r, kind = hit
+                n = c.replace_text(f, r, count=1 if nth is not None else 0)
+                if n:
+                    done += n
+                    kinds.append(kind)
             if done:
                 out[label] = f"OK({'+'.join(sorted(set(kinds)))}×{done})"
             else:
@@ -595,19 +628,32 @@ class HwpxDoc:
         return f"OK({n}셀 높이 x{factor})"
 
     # -- 일반 치환 ------------------------------------------------------------
-    def replace_all(self, find: str, repl: str) -> int:
+    def replace_all(self, find: str, repl: str, count: int = 0) -> int:
+        """문서 전체 치환. count>0이면 앞에서부터 그 건수만(작성예시 오염 방지용)."""
         n = 0
-        for c in self.cells():
-            n += c.replace_text(find, repl)
-        # 표 밖 본문 문단도 처리
+
+        def _left():
+            return (count - n) if count else 0
+
+        # 표 밖 본문 문단 먼저(문서 순서상 본문이 앞뒤에 있지만, 셀보다 본문 우선이 직관적)
+        in_cell_ts = {id(t) for c in self.cells() for t in c.tc.iter(f"{{{HP}}}t")}
         for name in sorted(self.sections):
-            root = self.sections[name]
-            in_cell_ts = {id(t) for c in self.cells() for t in c.tc.iter(f"{{{HP}}}t")}
-            ts = [t for t in root.iter(f"{{{HP}}}t") if id(t) not in in_cell_ts]
-            for t in ts:
-                if t.text and find in t.text:
+            for t in self.sections[name].iter(f"{{{HP}}}t"):
+                if id(t) in in_cell_ts or not t.text or find not in t.text:
+                    continue
+                if count:
+                    while find in t.text and n < count:
+                        t.text = t.text.replace(find, repl, 1)
+                        n += 1
+                    if n >= count:
+                        return n
+                else:
                     n += t.text.count(find)
                     t.text = t.text.replace(find, repl)
+        for c in self.cells():
+            if count and n >= count:
+                return n
+            n += c.replace_text(find, repl, count=_left())
         return n
 
     # -- 저장 ----------------------------------------------------------------

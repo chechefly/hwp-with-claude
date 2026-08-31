@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -801,6 +801,7 @@ class ReplaceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     find: str = Field(..., description="찾을 문자열 (예: '{{name}}')", min_length=1)
     replace: str = Field(..., description="바꿀 문자열 (예: '홍길동'). 빈 문자열이면 삭제.")
+    count: int = Field(default=0, description="치환 건수 제한(0=전부). 문서에 '작성예시'가 있어 빈 양식만 바꾸려면 1 — 예: 날짜 '20  년  월  일' 치환 시 예시 오염 방지", ge=0)
 
 
 class FillInput(BaseModel):
@@ -855,18 +856,24 @@ def hwp_open(params: OpenInput) -> str:
         bk = _backup_file(params.path, "open") if params.make_backup else None
         p = params.path
         low = p.lower()
-        if HwpxDoc is not None and low.endswith(".hwpx"):
-            # XML 엔진 직접 편집(한/글 불필요)
+        # ★확장자가 아니라 파일 매직으로 실제 포맷 판별:
+        #   관공서 파일 중 '.hwpx'인데 내용은 구형 .hwp(CFB)인 경우가 실존한다.
+        with open(p, "rb") as _f:
+            magic = _f.read(4)
+        is_zip = magic[:2] == b"PK"
+        if HwpxDoc is not None and is_zip and low.endswith((".hwpx", ".hwp")):
+            # 진짜 HWPX(zip) — XML 엔진 직접 편집(한/글 불필요)
             text = _xml_open(p, orig=None)
             mode = "[엔진: XML 직접 편집]"
-        elif HwpxDoc is not None and low.endswith(".hwp"):
-            # .hwp → 같은 폴더에 .hwpx로 1회 변환(COM) 후 XML 편집. 저장 시 .hwp 되변환.
-            work = p[: -len(".hwp")] + ".hwpx"
+        elif HwpxDoc is not None and low.endswith((".hwp", ".hwpx")):
+            # 구형 .hwp(CFB) — 같은 폴더에 진짜 hwpx 작업본 1회 변환(COM) 후 XML 편집.
+            base = p[: p.rfind(".")]
+            work = base + ("_x.hwpx" if low.endswith(".hwpx") else ".hwpx")
             if os.path.exists(work):
                 _backup_file(work, "convert")
             _com_convert(p, work, "HWPX")
             text = _xml_open(work, orig=p)
-            mode = f"[엔진: XML 직접 편집 — 작업본 {os.path.basename(work)}, 저장 시 .hwp 자동 반영]"
+            mode = f"[엔진: XML 직접 편집 — 작업본 {os.path.basename(work)}, 저장 시 원본 자동 반영]"
         else:
             text = _worker.submit(lambda: _worker.op_open(p))
             mode = "[엔진: COM]"
@@ -924,7 +931,7 @@ def hwp_replace(params: ReplaceInput) -> str:
     """
     try:
         if _xml_active():
-            n = _xml["doc"].replace_all(params.find, params.replace)
+            n = _xml["doc"].replace_all(params.find, params.replace, count=params.count)
         else:
             n = _worker.submit(lambda: _worker.op_replace(params.find, params.replace))
         if n == 0:
@@ -1031,8 +1038,9 @@ def hwp_save() -> str:
             msg = f"[저장 완료] {_xml['path']}"
             if _xml["orig"]:
                 _clear_readonly(_xml["orig"])
-                _com_convert(_xml["path"], _xml["orig"], "HWP")
-                msg += f"\n[.hwp 반영 완료] {_xml['orig']}"
+                fmt0 = "HWPX" if _xml["orig"].lower().endswith(".hwpx") else "HWP"
+                _com_convert(_xml["path"], _xml["orig"], fmt0)
+                msg += f"\n[원본 반영 완료] {_xml['orig']}"
             if bk:
                 msg += f"\n[덮어쓰기 전 백업] {bk}"
             return msg
@@ -1284,6 +1292,8 @@ class CheckByLabelInput(BaseModel):
         ..., description="체크할 옵션 텍스트 목록(네모 옆 단어). 예: ['동의함','운전자금']. 박스가 앞/뒤 어디든, □·☐ 두 종류 자동 처리."
     )
     mark: str = Field(default="☑", description="채울 기호(기본 ☑)")
+    nth: Optional[int] = Field(default=None, description="같은 라벨이 여러 곳일 때 N번째 매치만 체크(1부터). 생략=전부", ge=1)
+    table: Optional[int] = Field(default=None, description="이 표(1부터)의 라벨만 대상(작성예시 보호 등)", ge=1)
 
 
 @mcp.tool(
@@ -1304,7 +1314,8 @@ def hwp_check_by_label(params: CheckByLabelInput) -> str:
     """
     try:
         if _xml_active():
-            res = _xml["doc"].check_by_label(params.labels, params.mark)
+            tb = params.table - 1 if params.table else None
+            res = _xml["doc"].check_by_label(params.labels, params.mark, table=tb, nth=params.nth)
         else:
             res = _worker.submit(lambda: _worker.op_check_by_label(params.labels, params.mark))
         lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
