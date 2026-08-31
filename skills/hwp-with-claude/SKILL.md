@@ -80,6 +80,29 @@ hwp_fill_by_label({
 - (구버전 도구) `hwp_check`=□ 뒤만, `hwp_check_after(keyword, position="before"/"after")`=☐ 앞/뒤 — 세밀 제어가 필요할 때만.
 - 채운 뒤 **hwp_render로 확인**(엉뚱한 박스가 체크됐는지).
 
+## ★서명·도장 이미지 넣기
+`hwp_insert_image(table_index, addr="r8c0", image_path, width_mm=22, after_text="서명 또는 날인")`
+- PNG/JPG를 셀 안에 '글자처럼' 삽입 → 표 레이아웃이 안 어긋난다. 서명은 20~30mm.
+- `after_text`로 셀 안 특정 줄(예: "서명 또는 날인") 끝에 정확히 붙인다.
+- 삽입 후 **hwp_render로 위치·크기 확인**, 어색하면 width_mm/after_text 바꿔 재시도(엔진이 셀 통째 재작성 가능).
+
+## ★표 행 추가/삭제 (레이아웃 유지)
+`hwp_table_rows(action="add", table_index=1, row=10, count=2)` → r10을 서식 템플릿으로 아래에 2행 추가(높이·괘선·글자모양 승계, 내용 빈칸) → 값은 `hwp_set_cells`로.
+- `action="delete"`: row부터 count행 삭제. 세로병합 시작 행은 거부됨(정직) → 그 행은 수동 안내.
+- 내역 줄이 모자라면 add, 남으면 delete — **작업 후 반드시 hwp_render로 확인**.
+
+## ★페이지 맞춤 (넘침·빈 페이지 정리)
+표·내용이 다음 페이지로 살짝 넘어가 낭비가 생길 때:
+```
+1. hwp_layout_report        # 페이지별 내용 하단 % 확인 (예: "2페이지: 12% ← 거의 빈 페이지")
+2. hwp_table_rows(action="scale_height", table_index=1, factor=0.85)   # 행 최소높이 압축
+   (특정 행만: rows=[10,11,12])
+3. hwp_layout_report 재확인 → 아직 넘치면 factor 더 낮춰 반복(0.7까지), 과하면 렌더가 빽빽해지니 주의
+4. 내용 자체가 길면 셀 텍스트를 짧게 재작성(set_cells)하는 것도 병행
+```
+- 반대로 공백이 너무 크면 factor>1로 늘려 균형.
+- 최종 판단은 **hwp_render 눈 확인**이 기준.
+
 ## 표시/숨김
 - 기본은 숨김(백그라운드). 사용자가 실시간으로 보고 싶어 하면 `hwp_show_window(show=true)`로 한/글 창을 띄운다.
 

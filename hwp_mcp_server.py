@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -1362,6 +1362,26 @@ def hwp_fill_by_label(params: FillByLabelInput) -> str:
         return f"Error: {e}"
 
 
+class InsertImageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    table_index: int = Field(..., description="표 번호(1부터)", ge=1)
+    addr: str = Field(..., description="셀 주소 'r행c열'(table_map 기준). 예: 'r8c0'(서명란)")
+    image_path: str = Field(..., description="삽입할 PNG/JPG 절대경로(서명·도장 이미지 등)")
+    width_mm: float = Field(default=25.0, description="표시 폭(mm). 높이는 비율 자동. 서명은 20~30mm 권장", gt=1, le=180)
+    keep_text: bool = Field(default=True, description="False면 셀 기존 텍스트를 지우고 이미지만")
+    after_text: Optional[str] = Field(default=None, description="셀 안 이 텍스트가 있는 줄(문단) 끝에 삽입. 예: '서명 또는 날인' — 서명을 정확히 그 줄 옆에 붙임")
+
+
+class TableRowsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(..., description="'add'(row 아래 count행 추가, 서식 복제) | 'delete'(row부터 count행 삭제) | 'scale_height'(행 최소높이 factor배 — 페이지 맞춤용)")
+    table_index: int = Field(..., description="표 번호(1부터)", ge=1)
+    row: int = Field(default=0, description="기준 행(r번호, table_map 기준). add=이 행 아래에 추가/서식 복제, delete=이 행부터", ge=0)
+    count: int = Field(default=1, description="추가/삭제할 행 수", ge=1)
+    factor: float = Field(default=0.9, description="scale_height 전용: 높이 배율(0.7=30% 압축)", gt=0.3, le=3)
+    rows: Optional[List[int]] = Field(default=None, description="scale_height 전용: 대상 행 목록(생략=표 전체)")
+
+
 class ShowInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     show: bool = Field(default=True, description="True면 한/글 창을 화면에 표시, False면 숨김")
@@ -1436,6 +1456,118 @@ def hwp_render(params: RenderInput):
             with open(p, "rb") as f:
                 out.append(Image(data=f.read(), format="png"))
         return out
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="hwp_insert_image",
+    annotations={"title": "이미지 삽입(서명·도장)", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def hwp_insert_image(params: InsertImageInput) -> str:
+    """PNG/JPG 이미지를 표 셀 안에 '글자처럼' 삽입합니다(서명·도장·로고).
+
+    셀 흐름을 따르므로 표 레이아웃이 어긋나지 않습니다. width_mm로 크기 지정.
+    셀 주소는 hwp_table_map으로 확인. 삽입 후 hwp_render로 위치·크기 확인 필수.
+
+    Returns:
+        str: 결과. 실패 시 'Error: ...'
+    """
+    if not _xml_active():
+        return "Error: XML 편집 모드에서만 지원(문서를 hwp_open으로 여세요)."
+    if not os.path.exists(params.image_path):
+        return f"Error: 이미지 없음: {params.image_path}"
+    mm2 = re.match(r"^r(\d+)c(\d+)$", params.addr.strip())
+    if not mm2:
+        return "Error: addr 형식은 'r행c열' (예 'r8c0')."
+    try:
+        r = _xml["doc"].insert_image(params.table_index - 1, int(mm2.group(1)), int(mm2.group(2)),
+                                     params.image_path, params.width_mm, params.keep_text,
+                                     params.after_text)
+        return f"[이미지 삽입] {r}\nhwp_render로 위치·크기를 확인하고, 저장은 hwp_save."
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="hwp_table_rows",
+    annotations={"title": "표 행 추가/삭제/높이조절", "readOnlyHint": False,
+                 "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def hwp_table_rows(params: TableRowsInput) -> str:
+    """표 행을 추가/삭제하거나 행 높이를 조절합니다(레이아웃 유지).
+
+    - add: row 행을 서식 템플릿으로 그 아래에 count행 추가(높이·괘선·글자모양 승계, 내용 빈칸).
+      위에서 내려오는 세로병합은 자동 확장. 값은 hwp_set_cells로 채움.
+    - delete: row부터 count행 삭제(세로병합 시작 행은 거부 — 정직 보고).
+    - scale_height: 행 최소높이를 factor배로 — 내용이 다음 페이지로 넘칠 때 압축해 페이지를 맞춘다.
+      hwp_layout_report로 페이지 상태 보고 → 조절 → 다시 report 루프 권장.
+
+    Returns:
+        str: 결과. 실패 시 'Error: ...'
+    """
+    if not _xml_active():
+        return "Error: XML 편집 모드에서만 지원(문서를 hwp_open으로 여세요)."
+    try:
+        d = _xml["doc"]
+        ti = params.table_index - 1
+        if params.action == "add":
+            r = d.add_rows(ti, params.row, params.count)
+        elif params.action == "delete":
+            r = d.delete_rows(ti, params.row, params.count)
+        elif params.action == "scale_height":
+            r = d.scale_row_heights(ti, params.factor, params.rows)
+        else:
+            return "Error: action은 add/delete/scale_height 중 하나."
+        return f"[표 행 작업] {r}\nhwp_render 또는 hwp_layout_report로 확인 후 hwp_save."
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="hwp_layout_report",
+    annotations={"title": "페이지 레이아웃 리포트", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def hwp_layout_report() -> str:
+    """페이지별 내용 채움 상태를 수치로 보고합니다(페이지 맞춤 판단용).
+
+    각 페이지의 내용 최하단 위치(%)를 측정 — 마지막 페이지가 조금만 차 있으면(예: 15%)
+    행높이 압축(hwp_table_rows scale_height)이나 내용 줄이기로 앞 페이지에 합치는 판단 근거.
+
+    Returns:
+        str: 페이지별 리포트. 실패 시 'Error: ...'
+    """
+    try:
+        import tempfile
+        import fitz
+        pdf = os.path.join(tempfile.gettempdir(), "hwp_mcp_render", "layout.pdf")
+        os.makedirs(os.path.dirname(pdf), exist_ok=True)
+        if _xml_active():
+            _xml["doc"].save()
+            _com_convert(_xml["path"], pdf, "PDF")
+        else:
+            _worker.submit(lambda: _worker.op_export_pdf(pdf))
+        doc = fitz.open(pdf)
+        lines = [f"[레이아웃 리포트 — 총 {doc.page_count}페이지]"]
+        for i in range(doc.page_count):
+            pix = doc[i].get_pixmap(dpi=36, alpha=False)
+            w, h, s = pix.width, pix.height, pix.samples
+            bottom = 0
+            for y in range(h - 1, -1, -1):
+                if min(s[y * w * 3:(y + 1) * w * 3]) < 235:
+                    bottom = y + 1
+                    break
+            pct = round(bottom * 100 / h)
+            note = ""
+            if i == doc.page_count - 1 and pct <= 30 and doc.page_count > 1:
+                note = " ← 거의 빈 페이지: scale_height(0.8~0.9)로 압축해 앞 페이지에 합치는 것 고려"
+            elif pct >= 97:
+                note = " ← 꽉 참(넘침 직전)"
+            lines.append(f"  {i + 1}페이지: 내용 하단 {pct}%{note}")
+        doc.close()
+        return "\n".join(lines)
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 
