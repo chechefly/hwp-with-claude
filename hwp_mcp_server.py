@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "0.8.0"
+__version__ = "1.0.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -737,6 +737,46 @@ class HwpWorker:
 
 _worker = HwpWorker()
 
+# ---------------------------------------------------------------------------
+# ★v1.0 XML 편집 엔진(hwpx_engine) — "편집은 XML 유일, 한/글(COM)은 변환·렌더 전용"
+#   .hwpx는 직접 열고, .hwp는 COM으로 1회 변환 후 XML로 편집. 저장 시 .hwp 되변환.
+#   커서·Find·클립보드·표이동 등 버그의 근원이던 COM '편집' 조작은 더 이상 쓰지 않는다.
+# ---------------------------------------------------------------------------
+try:
+    from hwpx_engine import HwpxDoc  # 같은 폴더
+except Exception:  # noqa: BLE001
+    HwpxDoc = None
+
+_xml = {"doc": None, "path": None, "orig": None}
+# doc: HwpxDoc, path: 편집 대상 .hwpx, orig: 원본이 .hwp였으면 그 경로(save 때 되변환)
+
+
+def _xml_active() -> bool:
+    return _xml["doc"] is not None
+
+
+def _xml_close() -> None:
+    if _xml["doc"] is not None:
+        try:
+            _xml["doc"].close()
+        except Exception:
+            pass
+    _xml.update({"doc": None, "path": None, "orig": None})
+
+
+def _xml_open(hwpx_path: str, orig: Optional[str]) -> str:
+    _xml_close()
+    doc = HwpxDoc(hwpx_path)
+    _xml.update({"doc": doc, "path": hwpx_path, "orig": orig})
+    return doc.full_text()
+
+
+def _com_convert(src: str, dst: str, fmt: str) -> None:
+    """한/글(COM)로 포맷 변환만 수행(열기→다른형식 저장→닫기). 편집엔 관여 안 함."""
+    _worker.submit(lambda: _worker.op_open(src))
+    _worker.submit(lambda: _worker.op_save_as(dst, fmt))
+    _worker.submit(lambda: _worker.op_close_doc())
+
 
 @atexit.register
 def _cleanup_engine() -> None:
@@ -813,8 +853,24 @@ def hwp_open(params: OpenInput) -> str:
         return f"Error: 파일이 존재하지 않습니다: {params.path}"
     try:
         bk = _backup_file(params.path, "open") if params.make_backup else None
-        text = _worker.submit(lambda: _worker.op_open(params.path))
-        head = f"[열림] {params.path}"
+        p = params.path
+        low = p.lower()
+        if HwpxDoc is not None and low.endswith(".hwpx"):
+            # XML 엔진 직접 편집(한/글 불필요)
+            text = _xml_open(p, orig=None)
+            mode = "[엔진: XML 직접 편집]"
+        elif HwpxDoc is not None and low.endswith(".hwp"):
+            # .hwp → 같은 폴더에 .hwpx로 1회 변환(COM) 후 XML 편집. 저장 시 .hwp 되변환.
+            work = p[: -len(".hwp")] + ".hwpx"
+            if os.path.exists(work):
+                _backup_file(work, "convert")
+            _com_convert(p, work, "HWPX")
+            text = _xml_open(work, orig=p)
+            mode = f"[엔진: XML 직접 편집 — 작업본 {os.path.basename(work)}, 저장 시 .hwp 자동 반영]"
+        else:
+            text = _worker.submit(lambda: _worker.op_open(p))
+            mode = "[엔진: COM]"
+        head = f"[열림] {p}\n{mode}"
         if bk:
             head += f"\n[자동 백업] {bk}"
         return f"{head}\n\n--- 문서 텍스트 ---\n{text}"
@@ -830,6 +886,7 @@ def hwp_open(params: OpenInput) -> str:
 def hwp_new() -> str:
     """새 빈 한글 문서를 만듭니다. 저장하려면 hwp_save_as를 사용하세요."""
     try:
+        _xml_close()
         _worker.submit(_worker.op_new)
         return "[새 문서 생성됨] 내용을 채운 뒤 hwp_save_as로 저장하세요."
     except Exception as e:  # noqa: BLE001
@@ -844,6 +901,8 @@ def hwp_new() -> str:
 def hwp_read_text() -> str:
     """현재 열려 있는 문서의 전체 텍스트를 반환합니다."""
     try:
+        if _xml_active():
+            return _xml["doc"].full_text()
         return _worker.submit(_worker.op_read)
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
@@ -864,10 +923,13 @@ def hwp_replace(params: ReplaceInput) -> str:
         str: 치환 결과 요약. 실패 시 'Error: ...'
     """
     try:
-        n = _worker.submit(lambda: _worker.op_replace(params.find, params.replace))
+        if _xml_active():
+            n = _xml["doc"].replace_all(params.find, params.replace)
+        else:
+            n = _worker.submit(lambda: _worker.op_replace(params.find, params.replace))
         if n == 0:
             return f"'{params.find}' 을(를) 찾지 못했습니다 (치환 0건)."
-        return f"'{params.find}' → '{params.replace}' : 약 {n}건 치환 완료. (저장하려면 hwp_save)"
+        return f"'{params.find}' → '{params.replace}' : {n}건 치환 완료. (저장하려면 hwp_save)"
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 
@@ -889,7 +951,10 @@ def hwp_fill(params: FillInput) -> str:
     try:
         lines = []
         for find, replace in params.replacements.items():
-            n = _worker.submit(lambda f=find, r=replace: _worker.op_replace(f, r))
+            if _xml_active():
+                n = _xml["doc"].replace_all(find, replace)
+            else:
+                n = _worker.submit(lambda f=find, r=replace: _worker.op_replace(f, r))
             mark = "✓" if n > 0 else "✗(못찾음)"
             lines.append(f"  {mark} '{find}' → '{replace}' ({n}건)")
         return "[일괄 채우기 결과]\n" + "\n".join(lines) + "\n\n저장하려면 hwp_save 를 호출하세요."
@@ -905,6 +970,8 @@ def hwp_fill(params: FillInput) -> str:
 def hwp_insert_text(params: InsertInput) -> str:
     """문서에 텍스트를 삽입합니다(기본: 문서 맨 끝)."""
     try:
+        if _xml_active():
+            return "Error: XML 편집 모드에서는 미지원 — 표 칸은 hwp_fill_by_label, 문구는 hwp_replace를 쓰세요."
         _worker.submit(lambda: _worker.op_insert(params.text, params.at_end))
         pos = "맨 끝" if params.at_end else "현재 커서 위치"
         return f"[{pos}에 삽입 완료] 저장하려면 hwp_save 를 호출하세요."
@@ -923,6 +990,8 @@ def hwp_list_fields() -> str:
     관공서/회사 양식이 누름틀로 만들어진 경우, 이 목록을 보고 hwp_fill_fields로 채웁니다.
     """
     try:
+        if _xml_active():
+            return "Error: XML 편집 모드에서는 미지원 — hwp_fill_by_label(라벨 기반)을 쓰세요."
         fields = _worker.submit(_worker.op_list_fields)
         if not fields:
             return "누름틀 필드가 없습니다. (자리표시자 방식이라면 hwp_read_text 후 hwp_fill 사용)"
@@ -939,6 +1008,8 @@ def hwp_list_fields() -> str:
 def hwp_fill_fields(params: FillFieldsInput) -> str:
     """누름틀(필드) 이름별로 값을 채웁니다. 먼저 hwp_list_fields로 이름을 확인하세요."""
     try:
+        if _xml_active():
+            return "Error: XML 편집 모드에서는 미지원 — hwp_fill_by_label(라벨 기반)을 쓰세요."
         res = _worker.submit(lambda: _worker.op_fill_fields(params.values))
         lines = [f"  {'✓' if ok else '✗'} {name}" for name, ok in res.items()]
         return "[필드 채우기 결과]\n" + "\n".join(lines) + "\n\n저장하려면 hwp_save 를 호출하세요."
@@ -954,6 +1025,17 @@ def hwp_fill_fields(params: FillFieldsInput) -> str:
 def hwp_save() -> str:
     """현재 문서를 원래 파일에 덮어 저장합니다(덮어쓰기 전 자동 백업 → 가역적)."""
     try:
+        if _xml_active():
+            bk = _backup_file(_xml["orig"] or _xml["path"], "presave")
+            _xml["doc"].save()
+            msg = f"[저장 완료] {_xml['path']}"
+            if _xml["orig"]:
+                _clear_readonly(_xml["orig"])
+                _com_convert(_xml["path"], _xml["orig"], "HWP")
+                msg += f"\n[.hwp 반영 완료] {_xml['orig']}"
+            if bk:
+                msg += f"\n[덮어쓰기 전 백업] {bk}"
+            return msg
         bk = _backup_file(_worker.current_path or "", "presave")
         path = _worker.submit(_worker.op_save)
         msg = f"[저장 완료] {path}"
@@ -979,7 +1061,18 @@ def hwp_save_as(params: SaveAsInput) -> str:
     try:
         # 기존 파일을 덮어쓰는 경우 백업(가역성)
         bk = _backup_file(params.path, "presave") if os.path.exists(params.path) else None
-        path = _worker.submit(lambda: _worker.op_save_as(params.path, fmt))
+        if _xml_active():
+            _xml["doc"].save()  # 편집분 확정
+            _clear_readonly(params.path)
+            if fmt == "HWPX":
+                if os.path.abspath(params.path) != os.path.abspath(_xml["path"]):
+                    shutil.copy2(_xml["path"], params.path)
+                path = params.path
+            else:  # HWP / PDF — COM 변환
+                _com_convert(_xml["path"], params.path, fmt)
+                path = params.path
+        else:
+            path = _worker.submit(lambda: _worker.op_save_as(params.path, fmt))
         msg = f"[저장 완료 / {fmt}] {path}"
         if bk:
             msg += f"\n[덮어쓰기 전 백업] {bk}"
@@ -997,6 +1090,9 @@ def hwp_close() -> str:
     """현재 문서를 닫습니다. 한/글 엔진은 다음 파일을 위해 백그라운드에 유지됩니다
     (엔진은 MCP 서버가 종료될 때 자동으로 정리됩니다)."""
     try:
+        if _xml_active():
+            _xml_close()
+            return "[문서 닫힘] (XML 편집 모드 — 파일 잠금 없음)"
         _worker.submit(_worker.op_close_doc)
         return "[문서 닫힘] 엔진은 대기 상태로 유지됩니다."
     except Exception as e:  # noqa: BLE001
@@ -1010,6 +1106,11 @@ def hwp_close() -> str:
 )
 def hwp_status() -> str:
     """현재 열려 있는 문서 경로 등 상태를 반환합니다."""
+    if _xml_active():
+        s = f"현재 문서(XML 편집): {_xml['path']}"
+        if _xml["orig"]:
+            s += f"\n원본(.hwp, 저장 시 반영): {_xml['orig']}"
+        return s
     path = _worker.current_path
     if _worker._hwp is None:
         return "열린 문서 없음 (엔진 미기동)."
@@ -1065,6 +1166,18 @@ def hwp_table_map(params: TableMapInput) -> str:
     """
     try:
         import json
+        if _xml_active():
+            doc = _xml["doc"]
+            ti = params.table_index - 1
+            rows = [c for c in doc.table_map() if c["table"] == ti]
+            if not rows:
+                return f"Error: 표 #{params.table_index} 없음(문서 내 표 {doc.table_count()}개)."
+            lines = [f"[표 #{params.table_index} / 문서 내 표 총 {doc.table_count()}개 — XML 정확 읽기]"]
+            for c in rows:
+                span = f" {c['colspan']}x{c['rowspan']}" if (c['colspan'], c['rowspan']) != (1, 1) else ""
+                lines.append(f"  r{c['row']}c{c['col']}{span}: {c['text']!r}")
+            lines.append("※ 채우려면 hwp_fill_by_label(라벨 기반) 또는 hwp_set_cells(cells={'r1c4':'값'})")
+            return "\n".join(lines)
         data = _worker.submit(lambda: _worker.op_table_map(params.table_index))
         n = _worker.submit(_worker._count_tables)
         return f"[표 #{params.table_index} / 문서 내 표 총 {n}개]\n" + json.dumps(data, ensure_ascii=False, indent=1)
@@ -1089,6 +1202,22 @@ def hwp_set_cells(params: SetCellsInput) -> str:
     if params.align not in (None, "left", "center", "right"):
         return "Error: align은 left/center/right 중 하나이거나 생략해야 합니다."
     try:
+        if _xml_active():
+            doc = _xml["doc"]
+            ti = params.table_index - 1
+            miss = []
+            for addr, val in params.cells.items():
+                mm = re.match(r"^r(\d+)c(\d+)$", addr.strip())
+                if not mm:
+                    miss.append(f"{addr}(형식오류: 'r행c열' 예 'r1c4')")
+                    continue
+                if not doc.set_cell_addr(ti, int(mm.group(1)), int(mm.group(2)), str(val)):
+                    miss.append(addr)
+            filled = len(params.cells) - len(miss)
+            msg = f"[표 #{params.table_index}] {filled}/{len(params.cells)}개 셀 입력 완료(XML)."
+            if miss:
+                msg += f" 못 찾음: {miss}"
+            return msg + "\n저장하려면 hwp_save 를 호출하세요."
         miss = _worker.submit(lambda: _worker.op_set_cells(params.table_index, params.cells, params.align))
         filled = len(params.cells) - len(miss)
         msg = f"[표 #{params.table_index}] {filled}/{len(params.cells)}개 셀 입력 완료."
@@ -1114,6 +1243,10 @@ def hwp_check(params: CheckInput) -> str:
         str: 라벨별 체크 건수. 실패 시 'Error: ...'
     """
     try:
+        if _xml_active():
+            res = _xml["doc"].check_by_label(params.labels, params.mark)
+            lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
+            return "[체크 결과(XML)]\n" + "\n".join(lines) + "\n\n저장하려면 hwp_save 를 호출하세요."
         res = _worker.submit(lambda: _worker.op_check(params.labels, params.mark))
         lines = [f"  {'✓' if c else '✗(못찾음)'} □{lbl} ({c}건)" for lbl, c in res.items()]
         return "[체크 결과]\n" + "\n".join(lines) + "\n\n저장하려면 hwp_save 를 호출하세요."
@@ -1136,6 +1269,9 @@ def hwp_check_after(params: CheckAfterInput) -> str:
         str: 처리 개수. 실패 시 'Error: ...'
     """
     try:
+        if _xml_active():
+            res = _xml["doc"].check_by_label([params.keyword], params.mark)
+            return f"[체크 결과(XML)] {params.keyword} → {res[params.keyword]}\n저장하려면 hwp_save 를 호출하세요."
         n = _worker.submit(lambda: _worker.op_check_after(params.keyword, params.mark, params.position))
         return f"['{params.keyword}' 뒤 네모 {n}개 체크 완료]\n저장하려면 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
@@ -1167,7 +1303,10 @@ def hwp_check_by_label(params: CheckByLabelInput) -> str:
         str: 라벨별 결과. 실패 시 'Error: ...'
     """
     try:
-        res = _worker.submit(lambda: _worker.op_check_by_label(params.labels, params.mark))
+        if _xml_active():
+            res = _xml["doc"].check_by_label(params.labels, params.mark)
+        else:
+            res = _worker.submit(lambda: _worker.op_check_by_label(params.labels, params.mark))
         lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
         return "[라벨 기반 체크 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
@@ -1183,6 +1322,7 @@ class FillByLabelInput(BaseModel):
     direction: str = Field(default="auto", description="값 위치: 'auto'(오른쪽→아래 칸 자동, 권장·TableRightCell 안 먹히는 표도 문자이동으로 해결) | 'right' | 'below' | 'inline'(같은 칸 라벨 뒤)")
     nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터). 값 딕셔너리의 nth로 라벨별 지정 가능", ge=1)
     text_style: str = Field(default="reset", description="삽입 값 서식: 'reset'(기본, 검정·강조해제·기본 글자모양 강제) | 'keep'(칸 서식 그대로)")
+    table: Optional[int] = Field(default=None, description="이 표(1부터)의 라벨만 대상. 예: 빈 양식=1, 작성예시=2인 문서에서 table=1이면 예시를 안 건드림", ge=1)
 
 
 @mcp.tool(
@@ -1209,8 +1349,12 @@ def hwp_fill_by_label(params: FillByLabelInput) -> str:
     if params.text_style not in ("reset", "keep"):
         return "Error: text_style은 reset/keep 중 하나여야 합니다."
     try:
-        res = _worker.submit(lambda: _worker.op_fill_by_label(
-            params.fills, params.direction, params.nth, params.text_style))
+        if _xml_active():
+            tb = params.table - 1 if params.table else None
+            res = _xml["doc"].fill_by_label(params.fills, params.direction, params.nth, table=tb)
+        else:
+            res = _worker.submit(lambda: _worker.op_fill_by_label(
+                params.fills, params.direction, params.nth, params.text_style))
         lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
         return "[라벨 기반 채우기 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
@@ -1254,7 +1398,12 @@ def hwp_render(params: RenderInput):
         outdir = params.out_dir or os.path.join(tempfile.gettempdir(), "hwp_mcp_render")
         os.makedirs(outdir, exist_ok=True)
         pdf = os.path.join(outdir, "current.pdf")
-        _worker.submit(lambda: _worker.op_export_pdf(pdf))
+        if _xml_active():
+            # XML 편집분을 파일에 확정 → 한/글로 열어 PDF만 뽑고 닫는다(편집 관여 없음)
+            _xml["doc"].save()
+            _com_convert(_xml["path"], pdf, "PDF")
+        else:
+            _worker.submit(lambda: _worker.op_export_pdf(pdf))
         doc = fitz.open(pdf)
         total = doc.page_count
         # 페이지 범위 파싱
@@ -1301,6 +1450,8 @@ def hwp_show_window(params: ShowInput) -> str:
     기본은 숨김 모드로 동작하지만, 진행 상황을 눈으로 보고 싶을 때 show=True 로 띄울 수 있습니다.
     """
     try:
+        if _xml_active():
+            return "XML 편집 모드에서는 창이 없습니다(파일 직접 편집). 확인은 hwp_render를 쓰세요."
         st = _worker.submit(lambda: _worker.op_show(params.show))
         return f"[한/글 창 {st}]"
     except Exception as e:  # noqa: BLE001
