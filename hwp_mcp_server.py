@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -98,6 +98,21 @@ def _list_backups(path: str) -> List[str]:
     items = [os.path.join(d, f) for f in os.listdir(d) if f.startswith(base + ".")]
     items.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return items
+
+
+def _clear_clipboard() -> None:
+    """클립보드를 비운다. 셀 Copy가 빈 셀에서 아무것도 못 담으면 '이전 클립보드 내용'이
+    그대로 읽혀 유출되므로(예: shell 명령·개인정보), 읽기 전에 반드시 비운다."""
+    if win32clipboard is None:
+        return
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.CloseClipboard()
+            return
+        except Exception:
+            time.sleep(0.03)
 
 
 def _clip_text() -> str:
@@ -347,6 +362,7 @@ class HwpWorker:
 
     def _read_current_cell(self):
         hwp = self._hwp
+        _clear_clipboard()               # 스테일 클립보드 유출 방지(빈 셀 → "" 보장)
         hwp.HAction.Run("TableCellBlock")
         hwp.HAction.Run("Copy")
         t = _clip_text()
@@ -430,8 +446,9 @@ class HwpWorker:
             out[label] = before.count(find)
         return out
 
-    def op_check_after(self, keyword, mark="☑"):
-        """keyword(예:'동의함') 를 찾아, 그 뒤의 특수 네모 박스(☐)를 지우고 mark 삽입.
+    def op_check_after(self, keyword, mark="☑", position="after"):
+        """keyword(예:'동의함')를 찾아, 그 근처의 특수 네모(☐)를 지우고 mark 삽입.
+        position: 'after'(단어 뒤 네모, 예: '동의함 ☐') | 'before'(단어 앞 네모, 예: '☐ 동의함').
         문서 끝→처음 되돌이(wrap)를 감지해 정지. 반환: 처리한 개수."""
         hwp = self._require_doc()
         hwp.HAction.Run("MoveDocBegin")
@@ -449,9 +466,16 @@ class HwpWorker:
             if pos in seen:
                 break
             seen.add(pos)
-            hwp.HAction.Run("MoveRight")
-            hwp.HAction.Run("MoveRight")      # keyword 뒤 공백 건너 박스 앞
-            hwp.HAction.Run("MoveSelRight")   # 박스 1글자 선택
+            if position == "before":
+                # '☐ 동의함' : keyword 앞의 네모를 선택
+                hwp.HAction.Run("Cancel")
+                hwp.HAction.Run("MoveLeft")       # 선택 해제 → keyword 앞
+                hwp.HAction.Run("MoveLeft")       # 공백 건너
+                hwp.HAction.Run("MoveSelRight")   # 박스 1글자 선택
+            else:
+                hwp.HAction.Run("MoveRight")
+                hwp.HAction.Run("MoveRight")      # keyword 뒤 공백 건너 박스 앞
+                hwp.HAction.Run("MoveSelRight")   # 박스 1글자 선택
             ac = hwp.CreateAction("InsertText")
             ps = ac.CreateSet()
             ps.SetItem("Text", mark)
@@ -459,43 +483,117 @@ class HwpWorker:
             n += 1
         return n
 
-    def op_fill_by_label(self, fills, direction="right", nth=1):
-        """라벨 텍스트를 Find로 찾아 인접 셀(또는 같은 셀)에 값을 채운다.
-        table_map 셀읽기가 실패하는 폼에도 동작한다(read_text가 보는 라벨을 앵커로 사용).
-        direction: 'right'(오른쪽 셀) | 'below'(아래 셀) | 'inline'(같은 셀, 라벨 바로 뒤).
-        nth: 같은 라벨이 여러 개면 몇 번째(1부터). 반환: {라벨: 결과}."""
+    def op_check_by_label(self, labels, mark="☑"):
+        """옵션 라벨(예:'동의함','운전자금')의 인접 네모를 체크(범용).
+        □(U+25A1)은 AllReplace로, ☐(U+2610)은 Find-이동으로 처리 → 두 종류 모두 커버.
+        박스가 라벨 앞이든 뒤든 자동 시도. 반환: {라벨: 결과}."""
         hwp = self._require_doc()
-        move = {"right": "TableRightCell", "below": "TableLowerCell"}.get(direction)
         out = {}
-        for label, value in fills.items():
-            hwp.HAction.Run("MoveDocBegin")
-            pset = hwp.HParameterSet.HFindReplace
-            found = False
-            for _ in range(max(1, nth)):
-                hwp.HAction.GetDefault("RepeatFind", pset.HSet)
-                pset.FindString = label
-                pset.IgnoreMessage = 1
-                pset.Direction = 0
-                found = hwp.HAction.Execute("RepeatFind", pset.HSet)
-                if not found:
+        for label in labels:
+            # 1) □(U+25A1): 라벨 앞/뒤 4패턴 AllReplace
+            did = 0
+            for find, repl in [("□" + label, mark + label),
+                               ("□ " + label, mark + " " + label),
+                               (label + "□", label + mark),
+                               (label + " □", label + " " + mark)]:
+                before = hwp.GetTextFile("TEXT", "")
+                cnt = before.count(find)
+                if cnt:
+                    act = hwp.CreateAction("AllReplace")
+                    p = act.CreateSet()
+                    p.SetItem("FindString", find)
+                    p.SetItem("ReplaceString", repl)
+                    p.SetItem("IgnoreMessage", 1)
+                    p.SetItem("Direction", 0)
+                    p.SetItem("ReplaceMode", 1)
+                    p.SetItem("MatchCase", 1)
+                    act.Execute(p)
+                    did += cnt
                     break
-            if not found:
-                out[label] = "라벨 못 찾음"
+            if did:
+                out[label] = f"OK(□×{did})"
                 continue
-            if direction == "inline":
-                hwp.HAction.Run("MoveRight")   # 선택 해제(라벨 끝) → 뒤에 이어붙임
-            else:
-                hwp.HAction.Run("Cancel")
-                if move is None or not hwp.HAction.Run(move):
-                    out[label] = "인접 셀 없음(direction 확인)"
-                    continue
-                hwp.HAction.Run("SelectAll")   # 값 셀 내용 비우기
-                hwp.HAction.Run("Delete")
+            # 2) ☐(U+2610): 라벨 뒤 → 앞 순으로 Find-이동
+            n = self.op_check_after(label, mark, "after")
+            if not n:
+                n = self.op_check_after(label, mark, "before")
+            out[label] = f"OK(☐×{n})" if n else "박스 못 찾음"
+        return out
+
+    def op_fill_by_label(self, fills, direction="auto", nth=1):
+        """라벨 텍스트를 Find로 찾아 인접 칸/같은 칸에 값을 채운다(read_text가 보는 라벨을 앵커로).
+        table_map 셀읽기가 실패하는 폼에도 동작.
+        - direction: 'auto'(오른쪽→아래→인라인 자동 시도, 권장) | 'right' | 'below' | 'inline'
+        - fills 값은 문자열이거나 {value, direction, nth, near} 딕셔너리(라벨별 세밀 제어).
+          near: 이 텍스트를 먼저 찾은 뒤 그 다음의 라벨을 매칭(중복 라벨 구분용).
+        - 공백 유연 매칭(라벨 공백 변형도 시도). 반환: {라벨: 'OK(방향)' | 실패이유}."""
+        hwp = self._require_doc()
+
+        def _insert(text):
             ac = hwp.CreateAction("InsertText")
             ps = ac.CreateSet()
-            ps.SetItem("Text", value)
+            ps.SetItem("Text", text)
             ac.Execute(ps)
-            out[label] = "OK"
+
+        def _do_find(s):
+            pset = hwp.HParameterSet.HFindReplace
+            hwp.HAction.GetDefault("RepeatFind", pset.HSet)
+            pset.FindString = s
+            pset.IgnoreMessage = 1
+            pset.Direction = 0
+            return hwp.HAction.Execute("RepeatFind", pset.HSet)
+
+        def _find(label, nth_, near):
+            # 공백 유연: 원본 → 공백제거 → 단일공백 정규화 순으로 시도
+            variants = list(dict.fromkeys([label, label.replace(" ", ""), " ".join(label.split())]))
+            for v in variants:
+                hwp.HAction.Run("MoveDocBegin")
+                if near and not _do_find(near):
+                    continue
+                ok = False
+                for _ in range(max(1, nth_)):
+                    ok = _do_find(v)
+                    if not ok:
+                        break
+                if ok:
+                    return True
+            return False
+
+        def _fill_dir(d, value):
+            # 호출 시 라벨이 방금 Find로 선택된 상태라고 가정
+            if d == "inline":
+                hwp.HAction.Run("MoveRight")   # 선택 해제(라벨 끝) → 뒤에 이어붙임
+                _insert(value)
+                return True
+            hwp.HAction.Run("Cancel")
+            mv = {"right": "TableRightCell", "below": "TableLowerCell"}.get(d)
+            if not mv or not hwp.HAction.Run(mv):
+                return False
+            hwp.HAction.Run("SelectAll")       # 값 칸 내용 비우기
+            hwp.HAction.Run("Delete")
+            _insert(value)
+            return True
+
+        out = {}
+        for label, spec in fills.items():
+            if isinstance(spec, dict):
+                value = str(spec.get("value", ""))
+                d = spec.get("direction", direction)
+                nth_ = int(spec.get("nth", nth))
+                near = spec.get("near")
+            else:
+                value, d, nth_, near = str(spec), direction, nth, None
+            dirs = ["right", "below", "inline"] if d == "auto" else [d]
+            result = "라벨 못 찾음"
+            for dd in dirs:
+                if not _find(label, nth_, near):
+                    result = "라벨 못 찾음"
+                    break  # 못 찾으면 방향 바꿔도 소용없음
+                if _fill_dir(dd, value):
+                    result = f"OK({dd})"
+                    break
+                result = "인접 칸 없음(표 아님?)"
+            out[label] = result
         return out
 
     def _require_doc(self):
@@ -813,8 +911,9 @@ class CheckInput(BaseModel):
 
 class CheckAfterInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    keyword: str = Field(..., description="이 텍스트 바로 뒤의 특수 네모(☐)를 체크. 예: '동의함'", min_length=1)
+    keyword: str = Field(..., description="이 텍스트 근처의 특수 네모(☐)를 체크. 예: '동의함'", min_length=1)
     mark: str = Field(default="☑", description="채울 기호(기본 ☑)")
+    position: str = Field(default="after", description="네모 위치: 'after'(단어 뒤, '동의함 ☐') | 'before'(단어 앞, '☐ 동의함')")
 
 
 @mcp.tool(
@@ -904,19 +1003,52 @@ def hwp_check_after(params: CheckAfterInput) -> str:
         str: 처리 개수. 실패 시 'Error: ...'
     """
     try:
-        n = _worker.submit(lambda: _worker.op_check_after(params.keyword, params.mark))
+        n = _worker.submit(lambda: _worker.op_check_after(params.keyword, params.mark, params.position))
         return f"['{params.keyword}' 뒤 네모 {n}개 체크 완료]\n저장하려면 hwp_save 를 호출하세요."
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}"
+
+
+class CheckByLabelInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    labels: List[str] = Field(
+        ..., description="체크할 옵션 텍스트 목록(네모 옆 단어). 예: ['동의함','운전자금']. 박스가 앞/뒤 어디든, □·☐ 두 종류 자동 처리."
+    )
+    mark: str = Field(default="☑", description="채울 기호(기본 ☑)")
+
+
+@mcp.tool(
+    name="hwp_check_by_label",
+    annotations={"title": "라벨로 체크박스 체크(범용·권장)", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def hwp_check_by_label(params: CheckByLabelInput) -> str:
+    """옵션 라벨 옆의 네모를 찾아 체크(☑)합니다. ★체크박스의 기본(권장) 도구★
+
+    □(U+25A1)·☐(U+2610) 두 종류, 박스가 라벨 앞이든 뒤든 자동으로 처리합니다.
+    (기존 hwp_check=□ 뒤만, hwp_check_after=☐ 뒤만 → 이걸로 통합)
+    예: labels=['동의함','운전자금','전자상거래 업종']
+    같은 라벨이 여러 곳이면 전부 체크됩니다.
+
+    Returns:
+        str: 라벨별 결과. 실패 시 'Error: ...'
+    """
+    try:
+        res = _worker.submit(lambda: _worker.op_check_by_label(params.labels, params.mark))
+        lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
+        return "[라벨 기반 체크 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 
 
 class FillByLabelInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    fills: Dict[str, str] = Field(
-        ..., description="{라벨: 값}. 라벨은 문서에 실제로 있는 텍스트(공백 포함, 예: '기 업 체 명'). 값은 그 라벨의 인접 칸에 채워짐."
+    fills: Dict[str, Any] = Field(
+        ..., description="{라벨: 값}. 값은 문자열이거나 {value, direction, nth, near} 딕셔너리(라벨별 세밀 제어). "
+                         "라벨은 hwp_read_text에 보이는 그대로(공백 포함). near는 '이 텍스트 다음의 라벨'로 중복 라벨을 구분."
     )
-    direction: str = Field(default="right", description="값 위치: 'right'(라벨 오른쪽 칸) | 'below'(아래 칸) | 'inline'(같은 칸, 라벨 바로 뒤)")
-    nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터)", ge=1)
+    direction: str = Field(default="auto", description="값 위치: 'auto'(오른쪽→아래→인라인 자동, 권장) | 'right' | 'below' | 'inline'")
+    nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터). 값 딕셔너리의 nth로 라벨별 지정 가능", ge=1)
 
 
 @mcp.tool(
@@ -938,11 +1070,11 @@ def hwp_fill_by_label(params: FillByLabelInput) -> str:
     Returns:
         str: 라벨별 결과(OK / 라벨 못 찾음 / 인접 셀 없음). 실패 시 'Error: ...'
     """
-    if params.direction not in ("right", "below", "inline"):
-        return "Error: direction은 right/below/inline 중 하나여야 합니다."
+    if params.direction not in ("auto", "right", "below", "inline"):
+        return "Error: direction은 auto/right/below/inline 중 하나여야 합니다."
     try:
         res = _worker.submit(lambda: _worker.op_fill_by_label(params.fills, params.direction, params.nth))
-        lines = [f"  {'✓' if v == 'OK' else '✗'} {k} → {v}" for k, v in res.items()]
+        lines = [f"  {'✓' if str(v).startswith('OK') else '✗'} {k} → {v}" for k, v in res.items()]
         return "[라벨 기반 채우기 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
@@ -957,6 +1089,7 @@ class RenderInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     pages: str = Field(default="all", description="렌더할 페이지. 'all' 또는 '1', '2-4' 형식")
     dpi: int = Field(default=110, description="해상도(기본 110). 글자 확인엔 100~130 권장", ge=60, le=300)
+    out_dir: Optional[str] = Field(default=None, description="PNG 저장 폴더(절대경로). 생략 시 임시폴더. 접근 제한 환경에서 지정.")
 
 
 @mcp.tool(
@@ -979,7 +1112,7 @@ def hwp_render(params: RenderInput) -> str:
             import fitz  # PyMuPDF
         except Exception:
             return "Error: PyMuPDF(fitz)가 없습니다. 'pip install PyMuPDF' 후 사용하세요."
-        outdir = os.path.join(tempfile.gettempdir(), "hwp_mcp_render")
+        outdir = params.out_dir or os.path.join(tempfile.gettempdir(), "hwp_mcp_render")
         os.makedirs(outdir, exist_ok=True)
         pdf = os.path.join(outdir, "current.pdf")
         _worker.submit(lambda: _worker.op_export_pdf(pdf))
