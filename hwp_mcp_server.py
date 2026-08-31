@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -856,27 +856,44 @@ def hwp_open(params: OpenInput) -> str:
         bk = _backup_file(params.path, "open") if params.make_backup else None
         p = params.path
         low = p.lower()
-        # ★확장자가 아니라 파일 매직으로 실제 포맷 판별:
-        #   관공서 파일 중 '.hwpx'인데 내용은 구형 .hwp(CFB)인 경우가 실존한다.
-        with open(p, "rb") as _f:
-            magic = _f.read(4)
-        is_zip = magic[:2] == b"PK"
-        if HwpxDoc is not None and is_zip and low.endswith((".hwpx", ".hwp")):
-            # 진짜 HWPX(zip) — XML 엔진 직접 편집(한/글 불필요)
-            text = _xml_open(p, orig=None)
-            mode = "[엔진: XML 직접 편집]"
-        elif HwpxDoc is not None and low.endswith((".hwp", ".hwpx")):
-            # 구형 .hwp(CFB) — 같은 폴더에 진짜 hwpx 작업본 1회 변환(COM) 후 XML 편집.
-            base = p[: p.rfind(".")]
-            work = base + ("_x.hwpx" if low.endswith(".hwpx") else ".hwpx")
-            if os.path.exists(work):
-                _backup_file(work, "convert")
-            _com_convert(p, work, "HWPX")
-            text = _xml_open(work, orig=p)
-            mode = f"[엔진: XML 직접 편집 — 작업본 {os.path.basename(work)}, 저장 시 원본 자동 반영]"
-        else:
+        text = None
+        mode = ""
+        # ★XML 엔진 우선, 어떤 이유로든 준비가 실패하면 즉시 COM 엔진으로 자동 폴백.
+        #   (변환 실패·파일 잠금·엔진 오류 등으로 '열기 자체가 불가'가 되는 일을 구조적으로 방지)
+        if HwpxDoc is not None and low.endswith((".hwp", ".hwpx")):
+            try:
+                # 확장자가 아니라 파일 매직으로 실제 포맷 판별:
+                # 관공서 파일 중 '.hwpx'인데 내용은 구형 .hwp(CFB)인 경우가 실존한다.
+                with open(p, "rb") as _f:
+                    magic = _f.read(4)
+                if magic[:2] == b"PK":
+                    # 진짜 HWPX(zip) — XML 엔진 직접 편집(한/글 불필요)
+                    text = _xml_open(p, orig=None)
+                    mode = "[엔진: XML 직접 편집]"
+                else:
+                    # 구형 .hwp(CFB) — 같은 폴더에 진짜 hwpx 작업본 1회 변환(COM) 후 XML 편집.
+                    base = p[: p.rfind(".")]
+                    work = base + ("_x.hwpx" if low.endswith(".hwpx") else ".hwpx")
+                    if os.path.exists(work):
+                        _backup_file(work, "convert")
+                        _clear_readonly(work)
+                    _com_convert(p, work, "HWPX")
+                    if not os.path.exists(work):
+                        raise RuntimeError(f"변환본이 생성되지 않음: {work}")
+                    text = _xml_open(work, orig=p)
+                    mode = f"[엔진: XML 직접 편집 — 작업본 {os.path.basename(work)}, 저장 시 원본 자동 반영]"
+            except Exception as xe:  # noqa: BLE001
+                _xml_close()
+                try:
+                    _worker.submit(_worker.op_close_doc)  # 변환 중 열렸을 수 있는 문서 정리
+                except Exception:
+                    pass
+                text = None
+                mode = f"[엔진: COM(자동 폴백) — XML 준비 실패: {xe}]"
+        if text is None:
             text = _worker.submit(lambda: _worker.op_open(p))
-            mode = "[엔진: COM]"
+            if not mode:
+                mode = "[엔진: COM]"
         head = f"[열림] {p}\n{mode}"
         if bk:
             head += f"\n[자동 백업] {bk}"
