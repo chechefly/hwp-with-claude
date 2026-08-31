@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -459,6 +459,45 @@ class HwpWorker:
             n += 1
         return n
 
+    def op_fill_by_label(self, fills, direction="right", nth=1):
+        """라벨 텍스트를 Find로 찾아 인접 셀(또는 같은 셀)에 값을 채운다.
+        table_map 셀읽기가 실패하는 폼에도 동작한다(read_text가 보는 라벨을 앵커로 사용).
+        direction: 'right'(오른쪽 셀) | 'below'(아래 셀) | 'inline'(같은 셀, 라벨 바로 뒤).
+        nth: 같은 라벨이 여러 개면 몇 번째(1부터). 반환: {라벨: 결과}."""
+        hwp = self._require_doc()
+        move = {"right": "TableRightCell", "below": "TableLowerCell"}.get(direction)
+        out = {}
+        for label, value in fills.items():
+            hwp.HAction.Run("MoveDocBegin")
+            pset = hwp.HParameterSet.HFindReplace
+            found = False
+            for _ in range(max(1, nth)):
+                hwp.HAction.GetDefault("RepeatFind", pset.HSet)
+                pset.FindString = label
+                pset.IgnoreMessage = 1
+                pset.Direction = 0
+                found = hwp.HAction.Execute("RepeatFind", pset.HSet)
+                if not found:
+                    break
+            if not found:
+                out[label] = "라벨 못 찾음"
+                continue
+            if direction == "inline":
+                hwp.HAction.Run("MoveRight")   # 선택 해제(라벨 끝) → 뒤에 이어붙임
+            else:
+                hwp.HAction.Run("Cancel")
+                if move is None or not hwp.HAction.Run(move):
+                    out[label] = "인접 셀 없음(direction 확인)"
+                    continue
+                hwp.HAction.Run("SelectAll")   # 값 셀 내용 비우기
+                hwp.HAction.Run("Delete")
+            ac = hwp.CreateAction("InsertText")
+            ps = ac.CreateSet()
+            ps.SetItem("Text", value)
+            ac.Execute(ps)
+            out[label] = "OK"
+        return out
+
     def _require_doc(self):
         if self._hwp is None:
             raise RuntimeError("열려 있는 문서가 없습니다. 먼저 hwp_open 또는 hwp_new를 호출하세요.")
@@ -867,6 +906,44 @@ def hwp_check_after(params: CheckAfterInput) -> str:
     try:
         n = _worker.submit(lambda: _worker.op_check_after(params.keyword, params.mark))
         return f"['{params.keyword}' 뒤 네모 {n}개 체크 완료]\n저장하려면 hwp_save 를 호출하세요."
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}"
+
+
+class FillByLabelInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fills: Dict[str, str] = Field(
+        ..., description="{라벨: 값}. 라벨은 문서에 실제로 있는 텍스트(공백 포함, 예: '기 업 체 명'). 값은 그 라벨의 인접 칸에 채워짐."
+    )
+    direction: str = Field(default="right", description="값 위치: 'right'(라벨 오른쪽 칸) | 'below'(아래 칸) | 'inline'(같은 칸, 라벨 바로 뒤)")
+    nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터)", ge=1)
+
+
+@mcp.tool(
+    name="hwp_fill_by_label",
+    annotations={"title": "라벨로 채우기(범용·권장)", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def hwp_fill_by_label(params: FillByLabelInput) -> str:
+    """라벨 텍스트를 찾아 그 인접 칸에 값을 채웁니다. ★양식 채우기의 기본(권장) 도구★
+
+    table_map(셀 주소)이 셀을 못 읽는 폼에서도 동작합니다 — 사람처럼 "라벨 옆 칸"에 씁니다.
+    셀 주소·병합·컨테이너 타입을 신경 쓸 필요가 없습니다.
+
+    예: fills={'기 업 체 명':'위빌리브','대  표  자':'이선호','종 업 원 수':'5'}
+    - 라벨은 hwp_read_text에 보이는 그대로(공백 포함) 넣으세요.
+    - 값이 라벨 오른쪽이 아니라 아래면 direction='below', 같은 칸 안(라벨 뒤)이면 'inline'.
+    - 채운 뒤 hwp_render로 눈으로 확인하세요.
+
+    Returns:
+        str: 라벨별 결과(OK / 라벨 못 찾음 / 인접 셀 없음). 실패 시 'Error: ...'
+    """
+    if params.direction not in ("right", "below", "inline"):
+        return "Error: direction은 right/below/inline 중 하나여야 합니다."
+    try:
+        res = _worker.submit(lambda: _worker.op_fill_by_label(params.fills, params.direction, params.nth))
+        lines = [f"  {'✓' if v == 'OK' else '✗'} {k} → {v}" for k, v in res.items()]
+        return "[라벨 기반 채우기 결과]\n" + "\n".join(lines) + "\n\n확인은 hwp_render, 저장은 hwp_save 를 호출하세요."
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 

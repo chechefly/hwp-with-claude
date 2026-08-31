@@ -20,18 +20,33 @@ description: 한글(HWP/HWPX) 파일을 열어 내용을 읽고, 표 셀·체크
 ## 표준 작업 흐름
 ```
 1. (사본 생성)
-2. hwp_open(path)                     # 전체 텍스트 반환 → 문서 파악
-3. 각 표마다 hwp_table_map(table_index)  # {addr, text} 목록 → 빈 칸(값=빈문자열) = 채울 대상
-4. 채우기:
-   - hwp_set_cells(table_index, {주소: 값}, align)   # 빈 표 칸 채우기 (핵심)
-   - hwp_check([라벨...])                            # □ 체크박스 → ☑
-   - hwp_check_after(키워드)                         # 동의서식 ☐(특수문자) → ☑
-   - hwp_replace / hwp_fill                          # 자리표시자·일반 텍스트 치환
-   - hwp_insert_text                                # 커서/문서끝 텍스트 삽입
-5. hwp_render("all" 또는 "2-3") → 반환 PNG를 Read로 확인 → 틀리면 주소 고쳐 재작업
-6. hwp_save() 또는 hwp_save_as(path, "HWP"/"HWPX"/"PDF")
-7. hwp_close()
+2. hwp_open(path)                     # 전체 텍스트 반환 → 라벨/값 파악 (이게 제일 신뢰됨)
+3. 채우기 (★우선순위 순):
+   - ★hwp_fill_by_label({라벨: 값})   # ← 1순위. 라벨을 찾아 옆칸에 채움. table_map이 셀을 못 읽는 폼도 됨
+   - hwp_check([라벨...])              # □ 체크박스 → ☑
+   - hwp_check_after(키워드)           # 동의서식 ☐(특수문자) → ☑
+   - hwp_set_cells(idx, {주소:값})     # (보조) table_map으로 주소가 잘 읽히는 폼일 때
+   - hwp_replace / hwp_insert_text     # 자리표시자·일반 텍스트
+4. hwp_render("all" 또는 "2") → 반환 PNG를 Read로 확인 → 틀리면 재작업
+5. hwp_save() 또는 hwp_save_as(path, "HWP"/"HWPX"/"PDF")
+6. hwp_close()   # ★파일 잠금 해제(사용자 반납)
 ```
+
+## ★라벨로 채우기 `hwp_fill_by_label` — 가장 쉽고 범용적 (1순위)
+사람처럼 "라벨 옆 칸에 쓰는" 방식. **셀 주소·병합·컨테이너 타입을 몰라도 됨.**
+`hwp_table_map`이 셀을 빈 문자열로만 반환하는 폼(관공서 서식에 흔함)에서도 동작한다.
+```
+hwp_fill_by_label({
+  "기 업 체 명": "위빌리브",
+  "대  표  자": "이선호",
+  "종 업 원 수": "5"
+})
+```
+- **라벨은 `hwp_read_text`에 보이는 그대로**(공백까지 정확히) 넣는다. 예: "기 업 체 명"(자간 공백 포함).
+- 값이 라벨 **오른쪽 칸**이면 기본(`direction="right"`), **아래 칸**이면 `direction="below"`, **같은 칸 안 라벨 뒤**면 `direction="inline"`.
+- 같은 라벨이 여러 개면 `nth`로 지정.
+- 결과가 "라벨 못 찾음"이면 → read_text에서 정확한 라벨 문자열(공백/특수문자) 다시 확인.
+- 채운 뒤 **hwp_render로 눈으로 확인**(방향이 맞았는지). 세로로 밀렸으면 direction 바꿔 재시도.
 
 ## 표 셀 채우기 요령 (가장 중요)
 - 셀 주소는 스프레드시트식(A1, B2, C3 ...). `hwp_table_map`이 알려준다.
