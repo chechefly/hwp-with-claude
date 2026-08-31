@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -1351,7 +1351,8 @@ def hwp_fill_by_label(params: FillByLabelInput) -> str:
     try:
         if _xml_active():
             tb = params.table - 1 if params.table else None
-            res = _xml["doc"].fill_by_label(params.fills, params.direction, params.nth, table=tb)
+            res = _xml["doc"].fill_by_label(params.fills, params.direction, params.nth,
+                                            table=tb, text_style=params.text_style)
         else:
             res = _worker.submit(lambda: _worker.op_fill_by_label(
                 params.fills, params.direction, params.nth, params.text_style))

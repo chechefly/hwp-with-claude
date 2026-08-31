@@ -8,6 +8,7 @@ XML에 명시돼 있어 '폼마다 되냐 안 되냐'가 없다. 커서·Find·�
 """
 from __future__ import annotations
 
+import copy
 import re
 import shutil
 import zipfile
@@ -15,7 +16,8 @@ import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Any
 
 HP = "http://www.hancom.co.kr/hwpml/2011/paragraph"
-NS = {"hp": HP}
+HH = "http://www.hancom.co.kr/hwpml/2011/head"
+NS = {"hp": HP, "hh": HH}
 
 
 def _norm(s: str) -> str:
@@ -39,23 +41,40 @@ class Cell:
         return "".join(t.text or "" for t in self.tc.iter(f"{{{HP}}}t"))
 
     # -- 쓰기 ---------------------------------------------------------------
-    def set_text(self, value: str) -> None:
-        """셀 내용을 value로 교체. 첫 문단의 첫 run(폼 기본 charPr 보유)을 재사용하고
-        나머지 t는 제거 → 폼 기본 서식(검정)으로 들어간다."""
+    def set_text(self, value: str, clean=None) -> None:
+        """셀 내용을 value로 교체.
+        ★value에 줄바꿈(\\n)이 있으면 줄마다 문단을 만든다(여러 줄 칸·줄바꿈 정리용).
+        ★clean(orig_charpr_id)->new_id 콜백이 오면 삽입 run의 글자모양을 '정리된 서식'
+          (검정·강조 해제)으로 교체 — 폼 칸에 걸린 이상한 색/굵기를 안 물려받는다."""
+        lines = str(value).split("\n")
         sub = self.tc.find("hp:subList", NS)
         paras = sub.findall("hp:p", NS)
-        first_run = None
-        for p in paras:
-            for run in p.findall("hp:run", NS):
-                for t in list(run.findall("hp:t", NS)):
-                    run.remove(t)
-                if first_run is None:
-                    first_run = run
-        if first_run is None:  # run이 하나도 없는 셀(드묾) — 문단에 새 run
-            p = paras[0] if paras else ET.SubElement(sub, f"{{{HP}}}p")
-            first_run = ET.SubElement(p, f"{{{HP}}}run")
-        t = ET.SubElement(first_run, f"{{{HP}}}t")
-        t.text = value
+        # 기존 문단은 첫 번째만 남기고 제거(내용 통째 교체 — 어색한 줄바꿈 정리에도 사용)
+        for p in paras[1:]:
+            sub.remove(p)
+        first = paras[0] if paras else ET.SubElement(sub, f"{{{HP}}}p")
+        for run in first.findall("hp:run", NS):
+            for t in list(run.findall("hp:t", NS)):
+                run.remove(t)
+        run0 = first.find("hp:run", NS)
+        if run0 is None:  # run이 하나도 없는 셀(드묾)
+            run0 = ET.SubElement(first, f"{{{HP}}}run")
+        if clean is not None:
+            cid = clean(run0.get("charPrIDRef"))
+            if cid is not None:
+                run0.set("charPrIDRef", cid)
+        t = ET.SubElement(run0, f"{{{HP}}}t")
+        t.text = lines[0]
+        # 2번째 줄부터: 첫 문단을 복제(문단모양·글자모양 유지)해 텍스트만 바꿔 추가
+        for ln in lines[1:]:
+            np_ = copy.deepcopy(first)
+            for run in np_.findall("hp:run", NS):
+                for tt in list(run.findall("hp:t", NS)):
+                    run.remove(tt)
+            rr = np_.find("hp:run", NS)
+            tt = ET.SubElement(rr, f"{{{HP}}}t")
+            tt.text = ln
+            sub.append(np_)
 
     def replace_text(self, find: str, repl: str, count: int = 0) -> int:
         """셀 전체 텍스트 기준 치환 — ★run(서식조각) 경계에 걸쳐 있어도 동작.
@@ -118,7 +137,51 @@ class HwpxDoc:
                 for pfx, uri in re.findall(r'xmlns:([a-zA-Z0-9]+)="([^"]+)"', raw[:4000]):
                     ET.register_namespace(pfx, uri)
                 self.sections[name] = ET.fromstring(raw)
+        # header.xml — 글자모양(charPr) 정의부. '정리된 서식'(검정·강조해제) 생성에 사용.
+        self.header: Optional[ET.Element] = None
+        self._header_name = "Contents/header.xml"
+        if self._header_name in self._zin.namelist():
+            raw = self._zin.read(self._header_name).decode("utf-8")
+            for pfx, uri in re.findall(r'xmlns:([a-zA-Z0-9]+)="([^"]+)"', raw[:4000]):
+                ET.register_namespace(pfx, uri)
+            self.header = ET.fromstring(raw)
+        self._clean_cache: Dict[str, Optional[str]] = {}
         self._cells: Optional[List[Cell]] = None
+
+    def _clean_charpr(self, orig_id: Optional[str]) -> Optional[str]:
+        """orig_id 글자모양을 복제해 '정리된 서식'(검정·바탕없음·굵기/기울임/밑줄 해제)으로
+        만들어 header에 등록하고 새 id를 반환. 폼 칸의 이상한 색/강조를 안 물려받게 한다.
+        (글꼴·크기는 폼 정의를 유지 — 문서 통일감)"""
+        if self.header is None or orig_id is None:
+            return None
+        if orig_id in self._clean_cache:
+            return self._clean_cache[orig_id]
+        props = self.header.find(f".//{{{HH}}}charProperties")
+        src = None
+        if props is not None:
+            for cp in props.findall(f"{{{HH}}}charPr"):
+                if cp.get("id") == str(orig_id):
+                    src = cp
+                    break
+        if src is None or props is None:
+            self._clean_cache[orig_id] = None
+            return None
+        new = copy.deepcopy(src)
+        new.set("textColor", "#000000")
+        new.set("shadeColor", "none")
+        for tag in ("bold", "italic", "outline", "shadow", "emboss", "engrave",
+                    "supscript", "subscript"):
+            for el in new.findall(f"{{{HH}}}{tag}"):
+                new.remove(el)
+        ul = new.find(f"{{{HH}}}underline")
+        if ul is not None:
+            ul.set("type", "NONE")
+        new_id = str(max((int(cp.get("id", 0)) for cp in props.findall(f"{{{HH}}}charPr")), default=0) + 1)
+        new.set("id", new_id)
+        props.append(new)
+        props.set("itemCnt", str(len(props.findall(f"{{{HH}}}charPr"))))
+        self._clean_cache[orig_id] = new_id
+        return new_id
 
     # -- 구조 ---------------------------------------------------------------
     def cells(self) -> List[Cell]:
@@ -151,11 +214,13 @@ class HwpxDoc:
                 lines.append(s)
         return "\n".join(lines)
 
-    def set_cell_addr(self, table: int, row: int, col: int, value: str) -> bool:
+    def set_cell_addr(self, table: int, row: int, col: int, value: str,
+                      text_style: str = "reset") -> bool:
         """표/행/열 주소로 셀 내용 교체(주소는 table_map이 알려준 값)."""
+        clean = self._clean_charpr if text_style == "reset" else None
         for c in self.cells():
             if c.table_index == table and c.row == row and c.col == col:
-                c.set_text(value)
+                c.set_text(value, clean=clean)
                 return True
         return False
 
@@ -193,10 +258,13 @@ class HwpxDoc:
         return right() or below()
 
     def fill_by_label(self, fills: Dict[str, Any], direction: str = "auto",
-                      nth: int = 1, table: Optional[int] = None) -> Dict[str, str]:
+                      nth: int = 1, table: Optional[int] = None,
+                      text_style: str = "reset") -> Dict[str, str]:
         """{라벨: 값} 채우기. 값은 str 또는 {value,direction,nth,table} dict.
         table 지정 시 그 표(0부터)의 라벨만 매칭(예: 빈 양식=0, 작성예시=1).
-        반환: {라벨: 'OK(r,c)' | 실패이유} — XML은 쓰면 확실히 들어가므로 결과가 곧 사실."""
+        반환: {라벨: 'OK(r,c)' | 실패이유} — XML은 쓰면 확실히 들어가므로 결과가 곧 사실.
+        text_style='reset'(기본): 삽입값을 검정·강조해제 서식으로(칸의 이상한 색/굵기 무시)."""
+        clean = self._clean_charpr if text_style == "reset" else None
         out = {}
         for label, spec in fills.items():
             if isinstance(spec, dict):
@@ -217,14 +285,17 @@ class HwpxDoc:
                 continue
             lc = cands[n - 1]
             if d == "inline":
-                lc.replace_text(lc.text(), lc.text() + value, count=1) if lc.text() else lc.set_text(value)
+                if lc.text():
+                    lc.replace_text(lc.text(), lc.text() + value, count=1)
+                else:
+                    lc.set_text(value, clean=clean)
                 out[label] = f"OK(inline,t{lc.table_index} r{lc.row}c{lc.col})"
                 continue
             vc = self.value_cell(lc, d)
             if vc is None:
                 out[label] = "인접 칸 없음"
                 continue
-            vc.set_text(value)
+            vc.set_text(value, clean=clean)
             out[label] = f"OK(t{vc.table_index} r{vc.row}c{vc.col})"
         return out
 
@@ -321,6 +392,8 @@ class HwpxDoc:
                 data = self._zin.read(item.filename)
                 if item.filename in self.sections:
                     data = ET.tostring(self.sections[item.filename], encoding="unicode").encode("utf-8")
+                elif item.filename == self._header_name and self.header is not None:
+                    data = ET.tostring(self.header, encoding="unicode").encode("utf-8")
                 comp = zipfile.ZIP_STORED if item.filename == "mimetype" else zipfile.ZIP_DEFLATED
                 zout.writestr(item, data, comp)
         if out_path == self.path:
