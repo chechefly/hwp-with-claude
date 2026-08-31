@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -186,6 +186,15 @@ class HwpWorker:
 
     # 내부: 엔진 확보 (없으면 생성)
     def _ensure_engine(self):
+        # ★좀비 엔진 감지: 한/글이 밖에서 죽었으면(크래시·수동종료·taskkill) 기존 COM 참조는
+        #   'RPC 서버를 사용할 수 없습니다'류로 반죽음 상태가 된다 — SaveAs 무반응, GetTextFile
+        #   None 등 이상동작의 근원. 가벼운 호출로 생존 확인 후 죽었으면 버리고 재기동.
+        if self._hwp is not None:
+            try:
+                _ = self._hwp.Version  # 살아있으면 문자열, 죽었으면 com_error
+            except Exception:
+                self._hwp = None
+                self._current_path = None
         if self._hwp is None:
             _ensure_security_module()  # 보안 승인창 제거(레지스트리 보장)
             # win32com이 stdout에 찍을 수 있는 메시지가 MCP(JSON-RPC) 스트림을 오염시키지
@@ -229,7 +238,10 @@ class HwpWorker:
             raise RuntimeError(f"파일을 열지 못했습니다: {path}")
         self._set_visible(_VISIBLE)
         self._current_path = path
-        return hwp.GetTextFile("TEXT", "")
+        t = hwp.GetTextFile("TEXT", "")
+        if t is None:
+            raise RuntimeError("문서를 열었지만 내용을 읽을 수 없습니다(한/글 엔진 상태 이상). 다시 시도하세요.")
+        return t
 
     def op_new(self) -> None:
         hwp = self._ensure_engine()
@@ -239,11 +251,17 @@ class HwpWorker:
 
     def op_read(self) -> str:
         hwp = self._require_doc()
-        return hwp.GetTextFile("TEXT", "")
+        t = hwp.GetTextFile("TEXT", "")
+        if t is None:
+            raise RuntimeError("문서 텍스트를 읽을 수 없습니다(문서가 정상적으로 열려있지 않음). "
+                               "hwp_close 후 hwp_open으로 다시 여세요.")
+        return t
 
     def op_replace(self, find: str, replace: str) -> int:
         hwp = self._require_doc()
         before = hwp.GetTextFile("TEXT", "")
+        if before is None:
+            raise RuntimeError("문서가 정상적으로 열려있지 않습니다. hwp_close 후 hwp_open으로 다시 여세요.")
         act = hwp.CreateAction("AllReplace")
         pset = act.CreateSet()
         pset.SetItem("FindString", find)
@@ -730,6 +748,14 @@ class HwpWorker:
         return out
 
     def _require_doc(self):
+        if self._hwp is not None:
+            try:
+                _ = self._hwp.Version
+            except Exception:
+                # 한/글이 밖에서 종료됨 — 좀비 참조 제거 후 명확히 안내
+                self._hwp = None
+                self._current_path = None
+                raise RuntimeError("한/글 엔진이 종료되었습니다(외부 종료/크래시). hwp_open으로 다시 여세요.")
         if self._hwp is None:
             raise RuntimeError("열려 있는 문서가 없습니다. 먼저 hwp_open 또는 hwp_new를 호출하세요.")
         return self._hwp
