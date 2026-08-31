@@ -13,6 +13,7 @@ import contextlib
 import datetime
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -29,7 +30,7 @@ except Exception:  # pragma: no cover
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -513,6 +514,31 @@ class HwpWorker:
             if did:
                 out[label] = f"OK(□×{did})"
                 continue
+            # 1.5) [ ] ASCII 대괄호: 라벨 앞/뒤, 안쪽 공백 1~2칸 → [√]
+            am = "√"
+            did2 = 0
+            for find, repl in [("[ ] " + label, "[" + am + "] " + label),
+                               ("[  ] " + label, "[" + am + "] " + label),
+                               ("[ ]" + label, "[" + am + "]" + label),
+                               (label + " [ ]", label + " [" + am + "]"),
+                               (label + "[ ]", label + "[" + am + "]")]:
+                before = hwp.GetTextFile("TEXT", "")
+                cnt = before.count(find)
+                if cnt:
+                    act = hwp.CreateAction("AllReplace")
+                    p = act.CreateSet()
+                    p.SetItem("FindString", find)
+                    p.SetItem("ReplaceString", repl)
+                    p.SetItem("IgnoreMessage", 1)
+                    p.SetItem("Direction", 0)
+                    p.SetItem("ReplaceMode", 1)
+                    p.SetItem("MatchCase", 1)
+                    act.Execute(p)
+                    did2 += cnt
+                    break
+            if did2:
+                out[label] = f"OK([]×{did2})"
+                continue
             # 2) ☐(U+2610): 라벨 뒤 → 앞 순으로 Find-이동
             n = self.op_check_after(label, mark, "after")
             if not n:
@@ -522,12 +548,57 @@ class HwpWorker:
 
     def op_fill_by_label(self, fills, direction="auto", nth=1):
         """라벨 텍스트를 Find로 찾아 인접 칸/같은 칸에 값을 채운다(read_text가 보는 라벨을 앵커로).
-        table_map 셀읽기가 실패하는 폼에도 동작.
-        - direction: 'auto'(오른쪽→아래→인라인 자동 시도, 권장) | 'right' | 'below' | 'inline'
+        table_map 셀읽기가 실패하는 폼에도 동작. ★삽입 후 실제로 값이 들어갔는지 검증하여
+        정직하게 성공/실패를 반환한다(가짜 성공 방지).
+        - direction: 'auto'(오른쪽→아래 자동, 권장) | 'right' | 'below' | 'inline'
+          ※ 'auto'는 표 칸 이동(right/below)만 시도한다. 라벨과 값이 같은 칸이면 'inline'을 명시.
         - fills 값은 문자열이거나 {value, direction, nth, near} 딕셔너리(라벨별 세밀 제어).
           near: 이 텍스트를 먼저 찾은 뒤 그 다음의 라벨을 매칭(중복 라벨 구분용).
-        - 공백 유연 매칭(라벨 공백 변형도 시도). 반환: {라벨: 'OK(방향)' | 실패이유}."""
+        - 공백 유연 매칭. 반환: {라벨: 'OK(방향)' | '라벨 못 찾음' | '표 칸 이동 실패(수동입력 필요)'
+          | '삽입 확인 실패(수동입력 필요)'}."""
         hwp = self._require_doc()
+
+        def _doc_text():
+            try:
+                return hwp.GetTextFile("TEXT", "") or ""
+            except Exception:
+                return ""
+
+        def _cell_addr():
+            # 표 셀 안이면 '(A1)' 같은 주소가 나온다. 셀 밖이면 매칭 안 됨 → 파괴 방지용 가드.
+            try:
+                ki = hwp.KeyIndicator()
+                s = ki[8] if isinstance(ki, (list, tuple)) and len(ki) > 8 else str(ki)
+                return s or ""
+            except Exception:
+                return ""
+
+        def _cell_key():
+            # '(C2)' 같은 셀 주소 토큰만 추출. 셀 밖이면 ''.
+            mm = re.search(r"\(([A-Za-z]+[0-9]+)\)", _cell_addr())
+            return mm.group(1) if mm else ""
+
+        def _in_cell():
+            return bool(_cell_key())
+
+        def _cross_right():
+            # 오른쪽 다음 칸으로 이동. TableRightCell 우선, 안 먹히는 표는 문자단위 이동으로 셀 경계를 넘는다.
+            a0 = _cell_key()
+            hwp.HAction.Run("TableRightCell")
+            if _in_cell() and _cell_key() != a0:
+                return True
+            # 폴백: MoveRight로 라벨 셀을 빠져나가 다음 칸 진입(TableRightCell이 실패하는 폼용)
+            for _ in range(60):
+                if not hwp.HAction.Run("MoveRight"):
+                    break
+                if _cell_key() != a0:
+                    return _in_cell()
+            return False
+
+        def _cross_below():
+            a0 = _cell_key()
+            hwp.HAction.Run("TableLowerCell")
+            return _in_cell() and _cell_key() != a0
 
         def _insert(text):
             ac = hwp.CreateAction("InsertText")
@@ -560,15 +631,16 @@ class HwpWorker:
             return False
 
         def _fill_dir(d, value):
-            # 호출 시 라벨이 방금 Find로 선택된 상태라고 가정
+            # 호출 시 라벨이 방금 Find로 선택된 상태라고 가정. 삽입 성공 시 True.
             if d == "inline":
                 hwp.HAction.Run("MoveRight")   # 선택 해제(라벨 끝) → 뒤에 이어붙임
                 _insert(value)
                 return True
             hwp.HAction.Run("Cancel")
-            mv = {"right": "TableRightCell", "below": "TableLowerCell"}.get(d)
-            if not mv or not hwp.HAction.Run(mv):
+            crossed = _cross_right() if d == "right" else _cross_below() if d == "below" else False
+            if not crossed:
                 return False
+            # 여기서 반드시 표 셀 안(_cross_*가 보장) → SelectAll+Delete는 셀 내용만 지움(안전)
             hwp.HAction.Run("SelectAll")       # 값 칸 내용 비우기
             hwp.HAction.Run("Delete")
             _insert(value)
@@ -583,17 +655,26 @@ class HwpWorker:
                 near = spec.get("near")
             else:
                 value, d, nth_, near = str(spec), direction, nth, None
-            dirs = ["right", "below", "inline"] if d == "auto" else [d]
-            result = "라벨 못 찾음"
+            # auto는 표 칸 이동만(같은 칸 inline은 오배치 위험 → 명시적으로만)
+            dirs = ["right", "below"] if d == "auto" else [d]
+            result = None
             for dd in dirs:
                 if not _find(label, nth_, near):
                     result = "라벨 못 찾음"
                     break  # 못 찾으면 방향 바꿔도 소용없음
-                if _fill_dir(dd, value):
+                before = _doc_text()
+                if not _fill_dir(dd, value):
+                    result = "표 칸 이동 실패(수동입력 필요)"
+                    continue  # 다음 방향 시도
+                # ★삽입 검증: 값이 실제로 문서 텍스트에 새로 생겼는지 확인
+                if not value:
+                    result = f"OK({dd},빈칸)"
+                elif _doc_text().count(value) > before.count(value):
                     result = f"OK({dd})"
-                    break
-                result = "인접 칸 없음(표 아님?)"
-            out[label] = result
+                else:
+                    result = "삽입 확인 실패(수동입력 필요)"
+                break  # 삽입 동작을 했으면(성공이든 확인실패든) 방향 더 안 바꿈(중복삽입 방지)
+            out[label] = result or "표 칸 이동 실패(수동입력 필요)"
         return out
 
     def _require_doc(self):
@@ -1047,7 +1128,7 @@ class FillByLabelInput(BaseModel):
         ..., description="{라벨: 값}. 값은 문자열이거나 {value, direction, nth, near} 딕셔너리(라벨별 세밀 제어). "
                          "라벨은 hwp_read_text에 보이는 그대로(공백 포함). near는 '이 텍스트 다음의 라벨'로 중복 라벨을 구분."
     )
-    direction: str = Field(default="auto", description="값 위치: 'auto'(오른쪽→아래→인라인 자동, 권장) | 'right' | 'below' | 'inline'")
+    direction: str = Field(default="auto", description="값 위치: 'auto'(오른쪽→아래 칸 자동, 권장·TableRightCell 안 먹히는 표도 문자이동으로 해결) | 'right' | 'below' | 'inline'(같은 칸 라벨 뒤)")
     nth: int = Field(default=1, description="같은 라벨이 여러 개면 몇 번째(1부터). 값 딕셔너리의 nth로 라벨별 지정 가능", ge=1)
 
 
