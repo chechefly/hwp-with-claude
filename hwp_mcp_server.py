@@ -27,9 +27,9 @@ try:
 except Exception:  # pragma: no cover
     win32clipboard = None
 from pydantic import BaseModel, Field, ConfigDict
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 # 업데이트 확인용. GitHub 저장소 만든 뒤 아래 CHANGE_ME를 본인 GitHub 사용자명으로 바꾸세요.
 _UPDATE_URL = "https://raw.githubusercontent.com/chechefly/hwp-with-claude/main/version.json"
 
@@ -1090,6 +1090,7 @@ class RenderInput(BaseModel):
     pages: str = Field(default="all", description="렌더할 페이지. 'all' 또는 '1', '2-4' 형식")
     dpi: int = Field(default=110, description="해상도(기본 110). 글자 확인엔 100~130 권장", ge=60, le=300)
     out_dir: Optional[str] = Field(default=None, description="PNG 저장 폴더(절대경로). 생략 시 임시폴더. 접근 제한 환경에서 지정.")
+    return_image: bool = Field(default=True, description="True면 이미지를 결과에 직접 담아 반환(Cowork/클라우드에서도 바로 보임). False면 파일 경로만.")
 
 
 @mcp.tool(
@@ -1097,14 +1098,15 @@ class RenderInput(BaseModel):
     annotations={"title": "현재 문서를 이미지로 렌더(눈으로 확인)", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def hwp_render(params: RenderInput) -> str:
-    """현재 문서를 PDF로 내보낸 뒤 지정 페이지를 PNG 이미지로 렌더링하고 파일 경로를 반환합니다.
+def hwp_render(params: RenderInput):
+    """현재 문서를 PDF로 내보낸 뒤 지정 페이지를 PNG로 렌더링합니다.
 
-    반환된 PNG 경로를 Read 도구로 열어 실제 결과(값이 올바른 칸에 들어갔는지, 레이아웃 등)를
-    눈으로 확인하세요. 표를 채운 뒤 검증하는 표준 절차입니다.
+    기본(return_image=True)은 **이미지를 결과에 직접 담아 반환**하므로, 로컬이든
+    Cowork(클라우드)든 Claude가 바로 눈으로 봅니다(별도 Read 불필요). 채운 뒤 검증하는 표준 절차.
+    return_image=False면 저장된 PNG 파일 경로만 반환.
 
     Returns:
-        str: 렌더된 PNG 파일 경로 목록. 실패 시 'Error: ...'
+        이미지 콘텐츠 목록(+요약) 또는 파일 경로. 실패 시 'Error: ...'
     """
     try:
         import tempfile
@@ -1134,8 +1136,19 @@ def hwp_render(params: RenderInput) -> str:
             doc[i].get_pixmap(dpi=params.dpi).save(p)
             paths.append(p)
         doc.close()
-        return (f"[{total}페이지 중 {len(paths)}페이지 렌더 완료] "
-                f"아래 PNG를 Read로 열어 확인하세요:\n" + "\n".join(paths))
+        if not params.return_image:
+            return (f"[{total}페이지 중 {len(paths)}페이지 렌더 완료] "
+                    f"아래 PNG를 Read로 열어 확인하세요:\n" + "\n".join(paths))
+        # 이미지를 결과에 직접 담아 반환(Cowork/클라우드에서도 바로 보임) — 페이로드 과다 방지 위해 상한
+        MAX_IMG = 4
+        note = f"[{total}페이지 중 {len(paths)}페이지 렌더]"
+        if len(paths) > MAX_IMG:
+            note += f" — 이미지는 앞 {MAX_IMG}페이지만 첨부(전체 PNG는 {outdir} 에 저장). 특정 페이지는 pages로 지정."
+        out = [note]
+        for p in paths[:MAX_IMG]:
+            with open(p, "rb") as f:
+                out.append(Image(data=f.read(), format="png"))
+        return out
     except Exception as e:  # noqa: BLE001
         return f"Error: {e}"
 
